@@ -1,13 +1,22 @@
 # System Integrity Audit
 
-A cross-distribution Linux system-integrity and storage-health auditing project.
+Cross-distribution Linux package-integrity, filesystem, and storage-health auditing.
 
-**Status:** Version 2.0 is under development. The existing Ubuntu `debsums-audit` v1.7.1 remains the stable reference implementation. The new code on [`develop/v2.0`](https://github.com/rtcheek/system-integrity-audit/tree/develop/v2.0) is an experimental Debian/Ubuntu-only preview; Rocky Linux/RHEL package verification is not implemented yet.
+> **Status:** Version **2.0.0-dev.3** is an experimental development preview on [`develop/v2.0`](https://github.com/rtcheek/system-integrity-audit/tree/develop/v2.0). It includes Debian/Ubuntu (`debsums`) and Rocky Linux/RHEL (`rpm`) verification backends, but **live Rocky/RHEL validation is still required**. The existing `debsums-audit` v1.7.1 remains the stable Ubuntu reference.
 
-## Email reporting
+## Get started
 
-Email reporting is retained. The default `REPORT_TO="username@email.address"` is a **placeholder**, not a destination. When that value is unchanged (or empty), the audit does not send email. Configure a real recipient to enable it. See the [development README](https://github.com/rtcheek/system-integrity-audit/blob/develop/v2.0/README.md) and [example configuration](https://github.com/rtcheek/system-integrity-audit/blob/develop/v2.0/config/example.env).
+Read the [development README](https://github.com/rtcheek/system-integrity-audit/blob/develop/v2.0/README.md) for configuration, testing, and safe deployment. The development branch includes:
+
+- [Audit script](https://github.com/rtcheek/system-integrity-audit/blob/develop/v2.0/system-integrity-audit)
+- [Shared Ubuntu regressions](https://github.com/rtcheek/system-integrity-audit/blob/develop/v2.0/tests/regression.sh)
+- [Rocky/RHEL regressions](https://github.com/rtcheek/system-integrity-audit/blob/develop/v2.0/tests/rpm-regression.sh)
+- [RPM backend documentation](https://github.com/rtcheek/system-integrity-audit/blob/develop/v2.0/docs/rpm-backend.md)
+
+## Safe defaults
+
+Email reporting is retained. The default recipient is `username@email.address`; leaving that exact placeholder unchanged means **no email is sent**. Package auto-installation and journald auto-configuration are disabled by default.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT; see [LICENSE](LICENSE).
