@@ -23,7 +23,7 @@ The shared suite now covers mocked systemd 245, 249, and 255 journal branches; j
 
 ### Optional cautious live test on a Focal host
 
-Review the script and arrange installation of the read-only audit tools beforehand; automatic installation is **disabled** by default. Then run:
+Review the script first. Since v2.0.0-dev.8, automatic prerequisite installation and persistent journald setup are **enabled by default** when the script runs with sufficient privileges. For a cautious first live test on Ubuntu 20.04, disable both explicitly:
 
 ```bash
 sudo env \
