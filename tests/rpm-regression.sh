@@ -57,7 +57,7 @@ sed -i "s@^PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'@P
 printf 'ID=rocky\nPRETTY_NAME="Rocky Linux 9 (test fixture)"\n' > "$test_dir/rocky-os-release"
 printf 'ID=rhel\nPRETTY_NAME="Red Hat Enterprise Linux 9 (test fixture)"\n' > "$test_dir/rhel-os-release"
 ENV_ARGS=(
-    "MOCK_DIR=$test_dir" "AUTO_INSTALL_REQUIREMENTS=0"
+    "MOCK_DIR=$test_dir" "AUTO_INSTALL_REQUIREMENTS=0" "AUTO_ENABLE_PERSISTENT_JOURNAL=0"
     "KERNEL_LOG_CHECK_ENABLED=0" "SMART_CHECK_ENABLED=0" "FILESYSTEM_CHECKS_ENABLED=0"
     "PROGRESS_OUTPUT=never" "TERMINAL_OUTPUT=always" "STATEFUL_NOTIFICATIONS=0"
     "EXCEPTIONS_FILE=$test_dir/nonexistent-exceptions"
