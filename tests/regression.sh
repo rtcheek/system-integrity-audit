@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Non-destructive regression fixtures for system-integrity-audit 2.0.0-dev.6.
+# Non-destructive regression fixtures for system-integrity-audit 2.0.0-dev.7.
 # Run: bash tests/regression.sh [path/to/system-integrity-audit]
 set -euo pipefail
 SCRIPT=${1:-"$(dirname "$0")/../system-integrity-audit"}
@@ -22,6 +22,7 @@ kernel_warnings_file=$test_dir/kernel-warnings.txt
 kernel_scan_error_file=$test_dir/kernel-errors.txt
 smart_summary_file=$test_dir/smart-summary.tsv
 smart_details_file=$test_dir/smart-details.txt
+smart_short_test_notes_file=$test_dir/smart-short-test-notes.tsv
 filesystem_findings_file=$test_dir/fs-findings.tsv
 filesystem_details_file=$test_dir/fs-details.txt
 local_filesystems_file=$test_dir/fs-local.tsv
@@ -40,6 +41,10 @@ PROBE_TIMEOUT_SECONDS=10
 STATEFUL_NOTIFICATIONS=1
 NOTIFICATION_REPEAT_DAYS=7
 SMART_EXTENDED_DETAILS=0
+SMART_SHORT_TEST_AUTO=0
+SMART_SHORT_TEST_AGE_DAYS=60
+SMART_SHORT_TEST_STATE_FILE=$test_dir/smart-test-state.tsv
+SMART_CPU_STAT_PATH=$test_dir/procstat
 FORCE_REPORT=0
 SMART_MODE=ok
 export SMART_MODE
@@ -61,7 +66,8 @@ reset_fs() {
     fsck_finding_count=0
 }
 reset_smart() {
-    : > "$smart_summary_file"; : > "$smart_details_file"
+    : > "$smart_summary_file"; : > "$smart_details_file"; : > "$smart_short_test_notes_file"
+    smart_short_test_started_count=0; smart_short_test_skipped_count=0
     smart_device_count=0; smart_ok_count=0; smart_warning_count=0
     smart_fail_count=0; smart_error_count=0; smart_unsupported_count=0
 }
@@ -117,6 +123,14 @@ EOF
 cat > "$test_dir/bin/smartctl" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$MOCK_DIR/smart-calls"
+if [[ ${1:-} == -c && $* == *'-l selftest'* ]]; then
+    cat "$MOCK_DIR/smart-test-history.txt"
+    exit "${SMART_TEST_HISTORY_RC:-0}"
+fi
+if [[ ${1:-} == -t && ${2:-} == short ]]; then
+    printf '%s\n' "$*" >> "$MOCK_DIR/smart-test-starts.txt"
+    exit "${SMART_TEST_START_RC:-0}"
+fi
 if [[ $* == *'--scan-open'* ]]; then
     echo '/dev/sda -d megaraid,0 # discovered disk'
     exit 0
@@ -205,6 +219,161 @@ SMART_MODE=fail; export SMART_MODE
 run_smart_target /dev/sdx
 assert_eq "$smart_fail_count" 1 'SMART bit 3 failure'
 pass 'focused SMART status, optional detail, health failure'
+
+# Healthy ATA fixtures: scheduler reads SMART capability + self-test log and
+# refuses unsafe starts. No real disks are touched by these function tests.
+SMART_SHORT_TEST_AUTO=1
+SMART_SHORT_TEST_STATE_FILE=$test_dir/smart-test-state.tsv
+: > "$test_dir/smart-test-starts.txt"
+: > "$test_dir/smart-calls"
+rm -f "$SMART_SHORT_TEST_STATE_FILE"
+reset_smart
+health_fixture="$test_dir/health-ata.txt"
+printf 'Device Model: Test SSD\nSerial Number: DEVSERIAL\nATA Version is: ACS-4\nSMART overall-health self-assessment test result: PASSED\n' > "$health_fixture"
+write_smart_history() {
+    local status=${1:-0} current=${2:-6000} last=${3:-}
+    {
+        printf 'Self-test execution status:      ( %s) the self-test status\n' "$status"
+        printf 'Self-test supported.\n'
+        printf '9 Power_On_Hours 0x0032 100 100 --- Old_age Always - %s\n' "$current"
+        if [[ -z $last ]]; then
+            printf 'No self-tests have been logged.\n'
+        else
+            printf '# 1  Short offline  Completed without error  00%%  %s  -\n' "$last"
+        fi
+    } > "$test_dir/smart-test-history.txt"
+}
+# Simulated load for individual gate tests; the real /proc/stat sampler is
+# independently verified below with two jiffy snapshots.
+smart_cpu_quiet_enough() { smart_cpu_idle_bp=9950; smart_cpu_iowait_bp=10; return 0; }
+write_smart_history 249
+maybe_start_smart_short_test /dev/sdz '' /dev/sdz "$health_fixture" OK
+assert_eq "$smart_short_test_started_count" 0 'running self-test never duplicated'
+grep -q 'already in progress' "$smart_short_test_notes_file" || fail 'running self-test skip note absent'
+pass 'SMART scheduler refuses second test while firmware reports busy'
+
+reset_smart
+write_smart_history 0 6000 5999
+maybe_start_smart_short_test /dev/sdz '' /dev/sdz "$health_fixture" OK
+assert_eq "$smart_short_test_started_count" 0 'recent SMART test must not be restarted'
+grep -q 'within 1440 powered-on hours' "$smart_short_test_notes_file" || fail 'recent SMART test skip reason absent'
+pass 'SMART scheduler honors recent test history'
+
+reset_smart
+write_smart_history 0 6000 4000
+sed -i 's/Completed without error/Completed: read failure/' "$test_dir/smart-test-history.txt"
+maybe_start_smart_short_test /dev/sdz '' /dev/sdz "$health_fixture" OK
+assert_eq "$smart_short_test_started_count" 0 'failed prior self-test must not be overwritten by new test'
+grep -q 'previous self-test was not successful' "$smart_short_test_notes_file" || fail 'prior SMART failure skip reason missing'
+pass 'SMART scheduler refuses to obscure a failed previous self-test'
+
+reset_smart
+write_smart_history 0 6000
+smart_cpu_quiet_enough() { smart_cpu_idle_bp=9800; smart_cpu_iowait_bp=100; return 1; }
+maybe_start_smart_short_test /dev/sdz '' /dev/sdz "$health_fixture" OK
+assert_eq "$smart_short_test_started_count" 0 'CPU idle exactly 98% must not start'
+grep -q 'CPU idle=98.0%' "$smart_short_test_notes_file" || fail 'CPU busy skip reason absent'
+pass 'SMART scheduler requires CPU idle strictly above 98 percent'
+
+reset_smart
+smart_cpu_quiet_enough() { smart_cpu_idle_bp=9970; smart_cpu_iowait_bp=200; return 1; }
+maybe_start_smart_short_test /dev/sdz '' /dev/sdz "$health_fixture" OK
+assert_eq "$smart_short_test_started_count" 0 'iowait exactly 2% must not start'
+pass 'SMART scheduler requires iowait strictly below 2 percent'
+
+reset_smart
+smart_cpu_quiet_enough() { smart_cpu_idle_bp=-1; smart_cpu_iowait_bp=-1; return 1; }
+maybe_start_smart_short_test /dev/sdz '' /dev/sdz "$health_fixture" OK
+assert_eq "$smart_short_test_started_count" 0 'missing CPU metrics must not start'
+grep -q 'measurements unavailable' "$smart_short_test_notes_file" || fail 'unavailable CPU metrics skip absent'
+pass 'SMART scheduler fails closed on missing CPU readings'
+
+reset_smart
+smart_cpu_quiet_enough() { smart_cpu_idle_bp=9950; smart_cpu_iowait_bp=10; return 0; }
+write_smart_history 0 6000 4000
+maybe_start_smart_short_test /dev/sdz '' /dev/sdz "$health_fixture" OK
+assert_eq "$smart_short_test_started_count" 1 'old test should be initiated on idle ATA disk'
+grep -q 'non-captive short test initiated' "$smart_short_test_notes_file" || fail 'test start note absent'
+assert_eq "$(wc -l < "$test_dir/smart-test-starts.txt")" 1 'one short test dispatched'
+assert_eq "$(cat "$test_dir/smart-test-starts.txt")" '-t short /dev/sdz' 'start must not use -C or force'
+[[ -s $SMART_SHORT_TEST_STATE_FILE ]] || fail 'persistent SMART start state missing'
+pass 'SMART scheduler starts one background test and records durable timestamp'
+
+reset_smart
+write_smart_history 0 6000
+maybe_start_smart_short_test /dev/sdz '' /dev/sdz "$health_fixture" OK
+assert_eq "$smart_short_test_started_count" 0 'persistent timestamp must suppress repeat start'
+grep -q 'last audit-started test within 60d' "$smart_short_test_notes_file" || fail 'persistent state skip note missing'
+assert_eq "$(wc -l < "$test_dir/smart-test-starts.txt")" 1 'second audit must not restart disk test'
+pass 'SMART scheduler state prevents repeat before the log updates'
+
+reset_smart
+write_smart_history 0 6001 6000
+maybe_start_smart_short_test /dev/sdz '' /dev/sdz "$health_fixture" OK
+grep -q 'last logged: # 1.*Completed without error' "$smart_short_test_notes_file" || fail 'subsequent self-test result absent'
+pass 'SMART scheduler includes recorded prior result on subsequent audit'
+
+reset_smart
+SMART_SHORT_TEST_STATE_FILE=$test_dir/smart-test-state-unsafe
+ln -s "$test_dir/smart-test-state.tsv" "$SMART_SHORT_TEST_STATE_FILE"
+write_smart_history 0 6000
+maybe_start_smart_short_test /dev/sdz '' /dev/sdz "$health_fixture" OK
+assert_eq "$smart_short_test_started_count" 0 'symlink state file must block initiation'
+grep -q 'cannot read trusted' "$smart_short_test_notes_file" || fail 'state symlink rejection not reported'
+SMART_SHORT_TEST_STATE_FILE=$test_dir/smart-test-state.tsv
+pass 'SMART scheduler rejects symlinked state file'
+
+reset_smart
+write_smart_history 0 6000
+maybe_start_smart_short_test /dev/sdz 'megaraid,0' '/dev/sdz [megaraid,0]' "$health_fixture" OK
+maybe_start_smart_short_test /dev/nvme0n1 '' /dev/nvme0n1 "$health_fixture" OK
+assert_eq "$smart_short_test_started_count" 0 'RAID/NVMe auto starts not supported without device-specific proofs'
+pass 'SMART scheduler conservatively skips RAID and NVMe starts'
+
+# Verify real CPU sampler values (based on two simulated /proc/stat reads).
+unset -f smart_cpu_quiet_enough
+eval "$(sed -n '/^smart_cpu_quiet_enough() {/,/^}/p' "$SCRIPT")"
+printf 'cpu 10 0 0 1000 0 0 0 0 0 0\n' > "$SMART_CPU_STAT_PATH"
+sleep() { printf 'cpu 11 0 0 1199 0 0 0 0 0 0\n' > "$SMART_CPU_STAT_PATH"; }
+smart_cpu_quiet_enough || fail 'quiet CPU delta should meet threshold'
+assert_eq "$smart_cpu_idle_bp" 9950 'idle jiffies should be 99.50%'
+unset -f sleep
+pass 'SMART scheduler computes two-snapshot CPU idle/iowait correctly'
+
+# A tab in smartctl diagnostics must remain a tab, not escaped characters.
+actual_tab=$'\t'
+smart_line=$(sanitize_smart_detail_line $'Offline status:\tIdle')
+[[ "$smart_line" == *"$actual_tab"* ]] || fail 'SMART report escaped tab instead of retaining it'
+[[ "$smart_line" != *'\t'* ]] || fail 'SMART report printed backslash-t'
+pass 'SMART diagnostic formatting preserves literal tab alignment'
+SMART_SHORT_TEST_AUTO=0
+
+# Package notification identity must not depend on changed owner text,
+# and the previous hash format should migrate without spurious RESOLVED.
+prior_notification_file=$NOTIFICATION_STATE_FILE
+NOTIFICATION_STATE_FILE=$test_dir/package-identity-state.tsv
+reset_events
+printf 'CONFIG\told-owner [S.5...]\t/etc/sample.conf\n' > "$findings_file"
+assemble_finding_ledger
+prepare_notifications
+assert_eq "$notification_new_count" 1 'first config warning should be new'
+save_notification_state 1
+printf 'CONFIG\tnew-owner, another-owner [S.5...]\t/etc/sample.conf\n' > "$findings_file"
+assemble_finding_ledger
+prepare_notifications
+assert_eq "$notification_ongoing_count" 1 'owner edit must remain ongoing'
+assert_eq "$notification_resolved_count" 0 'owner edit cannot resolve same path warning'
+assert_eq "$notification_new_count" 0 'owner edit cannot create a new path warning'
+pass 'package notification identity ignores owner text changes'
+
+legacy_id=$(printf '%s' 'WARNING|PACKAGE|/etc/sample.conf|CONFIG old-owner' | sha256sum)
+legacy_id=${legacy_id%% *}
+printf '%s\tWARNING\tPACKAGE\t/etc/sample.conf\t%s\n' "$legacy_id" "$(date +%s)" > "$NOTIFICATION_STATE_FILE"
+prepare_notifications
+assert_eq "$notification_ongoing_count" 1 'legacy package state should migrate'
+assert_eq "$notification_resolved_count" 0 'legacy package state must not false-resolve'
+pass 'old package state migrates without false resolution'
+NOTIFICATION_STATE_FILE=$prior_notification_file
 
 MEGARAID_MAX_INDEX=33
 MEGARAID_COMPLETE_SCAN=1
@@ -352,7 +521,7 @@ MOCK_COVERAGE_MODE=normal
 export JOURNAL_TIMEOUT_SECONDS MOCK_COVERAGE_MODE
 pass 'coverage failures, empty history, short retention, and timeout handled safely'
 
-assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.6' 'embedded version'
+assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.7' 'embedded version'
 bash -n "$SCRIPT"
 pass 'version and Bash syntax'
 
@@ -433,7 +602,7 @@ assert_eq "$rc" 0 'full clean report exit success'
 grep -q 'Subject: .* TEST/OK - ' "$test_dir/last-email.eml" || fail 'clean status subject'
 grep -q '^From: "System Integrity Audit" <system-integrity-audit>' "$test_dir/last-email.eml" || fail 'visible From header'
 grep -q 'Audit coverage' "$test_dir/last-email.eml" || fail 'coverage section missing'
-grep -q 'Script version: *2.0.0-dev.6' "$test_dir/last-email.eml" || fail 'version absent in report'
+grep -q 'Script version: *2.0.0-dev.7' "$test_dir/last-email.eml" || fail 'version absent in report'
 [[ -f $test_dir/integration-state.tsv ]] || fail 'state file not persisted'
 pass 'full clean report, MIME sender, coverage, state persistence'
 
@@ -569,7 +738,7 @@ pass 'placeholder disables early-failure email'
 
 # RPM distributions are no longer blocked at initialization. A separate
 # regression script validates their full package and reporting lifecycle.
-assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.6' 'v2 development version'
+assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.7' 'v2 development version'
 pass 'RPM backend enabled in development release'
 
 # Probe timeout must return 124, and never silently claim the check succeeded.
