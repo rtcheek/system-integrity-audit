@@ -49,7 +49,7 @@ sudo env SMART_SHORT_TEST_AUTO=0 REPORT_TO=username@email.address FORCE_REPORT=1
 
 Or configure `SMART_SHORT_TEST_AUTO=0` permanently in the job environment. The audit still performs all original SMART health checks. `SMART_SHORT_TEST_AGE_DAYS=60` adjusts the interval, and `SMART_SHORT_TEST_STATE_FILE` changes the protected local tracking path.
 
-For a cautious first live test, keep email disabled with the exact placeholder `username@email.address` and host-change switches off:
+Since v2.0.0-dev.8, `AUTO_INSTALL_REQUIREMENTS=1` and `AUTO_ENABLE_PERSISTENT_JOURNAL=1` are the default, independently of SMART scheduling. For a cautious first live test, keep email disabled with the exact placeholder `username@email.address` and **explicitly** turn both host-change switches off:
 
 ```bash
 sudo env REPORT_TO=username@email.address FORCE_REPORT=1 \
