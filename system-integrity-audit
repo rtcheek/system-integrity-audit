@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# system-integrity-audit version 2.0.0-dev.5
+# system-integrity-audit version 2.0.0-dev.6
 # DEVELOPMENT PREVIEW: Debian/Ubuntu and Rocky/RHEL RPM backends.
 # Audit kernel/storage health and native package-managed file integrity.
 
@@ -12,10 +12,14 @@ export PATH
 export LC_ALL=C
 
 PROGRAM_NAME='system-integrity-audit'
-PROGRAM_VERSION='2.0.0-dev.5'
+PROGRAM_VERSION='2.0.0-dev.6'
 readonly PROGRAM_NAME PROGRAM_VERSION
 
 # Changelog:
+#   2.0.0-dev.6 (2026-11-12): Distinguish verified missing /run
+#                          directories from missing payload files, add
+#                          exact-path approved-missing exceptions, and
+#                          format multiple RPM package owners cleanly.
 #   2.0.0-dev.5 (2026-11-12): Make shared Ubuntu integration tests
 #                          independent of the host package manager by
 #                          mocking dpkg-query on RPM-based test hosts.
@@ -201,8 +205,10 @@ STATEFUL_NOTIFICATIONS="${STATEFUL_NOTIFICATIONS:-1}"
 NOTIFICATION_REPEAT_DAYS="${NOTIFICATION_REPEAT_DAYS:-7}"
 NOTIFICATION_STATE_FILE="${NOTIFICATION_STATE_FILE:-/var/lib/system-integrity-audit/findings.tsv}"
 EXCEPTIONS_FILE="${EXCEPTIONS_FILE:-/usr/local/etc/system-integrity-audit.ignore}"
-declare -a exception_patterns=()
+MISSING_EXCEPTIONS_FILE="${MISSING_EXCEPTIONS_FILE:-/usr/local/etc/system-integrity-audit.missing.ignore}"
+declare -a exception_patterns=() missing_exception_paths=()
 exception_pattern_count=0
+missing_exception_count=0
 OS_RELEASE_FILE="${OS_RELEASE_FILE:-/etc/os-release}"
 
 case "${1:-}" in
@@ -263,8 +269,11 @@ Environment overrides:
   NOTIFICATION_STATE_FILE=/var/lib/system-integrity-audit/findings.tsv
                                      Root-only state; ALERT/ERROR always emailed
   EXCEPTIONS_FILE=/usr/local/etc/system-integrity-audit.ignore
-                                     Ignore expected modified paths; shell globs allowed
-                                     MISSING files are never ignored
+                                     Ignore expected modifications; shell globs allowed
+  MISSING_EXCEPTIONS_FILE=/usr/local/etc/system-integrity-audit.missing.ignore
+                                     Exact absolute paths for approved missing files
+                                     Entries are visible in ignored findings;
+                                     no glob patterns accepted
 USAGE
         exit 0
         ;;
@@ -339,6 +348,46 @@ load_exception_patterns() {
 
     exception_pattern_count=${#exception_patterns[@]}
     return 0
+}
+
+# Missing package files use a separate, explicit allowlist. Unlike the
+# modifications file, paths are LITERAL, never shell patterns or globs.
+load_missing_exception_paths() {
+    local item line_number=0
+    missing_exception_paths=()
+    missing_exception_count=0
+
+    if [[ ! -e $MISSING_EXCEPTIONS_FILE && ! -L $MISSING_EXCEPTIONS_FILE ]]; then
+        return 0
+    fi
+    if [[ -L $MISSING_EXCEPTIONS_FILE || ! -f $MISSING_EXCEPTIONS_FILE ||
+          ! -r $MISSING_EXCEPTIONS_FILE ]]; then
+        printf '%s: approved missing-file list is not a readable regular, non-symlink file: %s\n' \
+            "$PROGRAM_NAME" "$MISSING_EXCEPTIONS_FILE" >&2
+        return 66
+    fi
+    while IFS= read -r item || [[ -n $item ]]; do
+        line_number=$((line_number + 1))
+        item=${item%$'\r'}
+        [[ -z $item || $item == \#* ]] && continue
+        if [[ $item != /* || $item == *'*'* || $item == *'?'* || $item == *'['* || $item == *']'* ]]; then
+            printf '%s: invalid exact missing-file path on line %s of %s: %s\n' \
+                "$PROGRAM_NAME" "$line_number" "$MISSING_EXCEPTIONS_FILE" \
+                "$(sanitize_text "$item")" >&2
+            return 65
+        fi
+        missing_exception_paths+=("$item")
+    done < "$MISSING_EXCEPTIONS_FILE"
+    missing_exception_count=${#missing_exception_paths[@]}
+    return 0
+}
+
+missing_path_is_approved() {
+    local file_path=$1 item
+    for item in "${missing_exception_paths[@]}"; do
+        [[ $file_path == "$item" ]] && return 0
+    done
+    return 1
 }
 
 changed_path_is_excepted() {
@@ -859,11 +908,19 @@ lookup_package_owners() {
 
     if [[ $PACKAGE_BACKEND == rpm ]]; then
         raw=$(run_probe "$PROBE_TIMEOUT_SECONDS" rpm -qf -- "$file_path" 2>/dev/null) || raw=''
-        if [[ -n $raw ]]; then
-            printf '%s' "$(sanitize_text "$raw")"
-        else
-            printf UNKNOWN
-        fi
+        # RPM can return multiple owners (for example three installed kernel
+        # versions). Join them, rather than leaking escaped newline markers.
+        joined=''
+        while IFS= read -r owner || [[ -n $owner ]]; do
+            [[ -n $owner ]] || continue
+            owner=$(sanitize_text "$owner")
+            if [[ -z ${seen[$owner]+x} ]]; then
+                seen[$owner]=1
+                if [[ -n $joined ]]; then joined+=', '; fi
+                joined+=$owner
+            fi
+        done <<< "$raw"
+        printf '%s' "${joined:-UNKNOWN}"
         return 0
     fi
 
@@ -2571,6 +2628,33 @@ run_rpm_once() {
     coverage_status=0
 }
 
+# Fail-closed handling for optional runtime directories. A missing RPM
+# record beneath /run is demoted to NOTICE only when the owning RPM itself
+# declares that exact pathname as a DIRECTORY in `rpm -q --dump`. Missing
+# runtime files, unverifiable records and other paths remain ALERTs.
+rpm_is_missing_runtime_directory() {
+    local file_path=$1 package dump_line metadata size mtime digest mode
+    local owner group isconfig isdoc rdev link all_owners dump
+    [[ $file_path == /run/* ]] || return 1
+    all_owners=$(run_probe "$PROBE_TIMEOUT_SECONDS" rpm -qf -- "$file_path" 2>/dev/null) || return 1
+    [[ -n $all_owners ]] || return 1
+    while IFS= read -r package || [[ -n $package ]]; do
+        [[ -n $package ]] || continue
+        dump=$(run_probe "$PROBE_TIMEOUT_SECONDS" rpm -q --dump -- "$package" 2>/dev/null) || continue
+        while IFS= read -r dump_line || [[ -n $dump_line ]]; do
+            # Match full pathname, including names with embedded spaces.
+            [[ $dump_line == "$file_path "* ]] || continue
+            metadata=${dump_line#"$file_path "}
+            read -r size mtime digest mode owner group isconfig isdoc rdev link <<< "$metadata"
+            [[ $mode =~ ^[0-7]{5,7}$ ]] || continue
+            if (( (8#$mode & 0170000) == 0040000 )); then
+                return 0
+            fi
+        done <<< "$dump"
+    done <<< "$all_owners"
+    return 1
+}
+
 build_rpm_findings() {
     local line flags marker file_path owners status detail
     rpm_recognized_count=0
@@ -2578,6 +2662,8 @@ build_rpm_findings() {
     rpm_timestamp_ignored_count=0
     rpm_ghost_skipped_count=0
     rpm_unverifiable_count=0
+    rpm_runtime_dir_notice_count=0
+    approved_missing_count=0
 
     : > "$findings_file"
     : > "$ignored_findings_file"
@@ -2642,7 +2728,16 @@ build_rpm_findings() {
         fi
         owners=$(lookup_package_owners "$file_path")
         detail="$owners [$flags${marker:+ $marker}]"
-        if [[ $status != MISSING ]] && changed_path_is_excepted "$file_path"; then
+        if [[ $status == MISSING ]] && missing_path_is_approved "$file_path"; then
+            printf 'APPROVED\t%s\t%s\n' "$(sanitize_text "$detail")" \
+                "$(sanitize_text "$file_path")" >> "$ignored_findings_file"
+            approved_missing_count=$((approved_missing_count + 1))
+        elif [[ $status == MISSING ]] && rpm_is_missing_runtime_directory "$file_path"; then
+            printf 'RUNTIME\t%s\t%s\n' \
+                "$(sanitize_text "$owners [missing RPM-owned runtime directory]")" \
+                "$(sanitize_text "$file_path")" >> "$findings_file"
+            rpm_runtime_dir_notice_count=$((rpm_runtime_dir_notice_count + 1))
+        elif [[ $status != MISSING ]] && changed_path_is_excepted "$file_path"; then
             printf 'IGNORED\t%s\t%s\n' "$(sanitize_text "$detail")" \
                 "$(sanitize_text "$file_path")" >> "$ignored_findings_file"
         else
@@ -2661,7 +2756,7 @@ build_rpm_findings() {
     missing_count=$(grep -c '^MISSING' "$findings_file" || true)
     ignored_changed_count=$(grep -c '^IGNORED' "$ignored_findings_file" || true)
     package_warning_count=$(grep -Ec '^(CONFIG|METADATA|UNKNOWN)' "$findings_file" || true)
-    package_notice_count=$(grep -c '^TIMESTAMP' "$findings_file" || true)
+    package_notice_count=$(grep -Ec '^(TIMESTAMP|RUNTIME)' "$findings_file" || true)
     coverage_count=0  # RPM verifies attributes present in its installed-package database.
 }
 
@@ -2700,10 +2795,17 @@ build_package_findings() {
         if [[ $line =~ ^debsums:\ missing\ file\ (.*)\ \(from\ (.*)\ package\)$ ]]; then
             file_path=${BASH_REMATCH[1]}
             package_name=${BASH_REMATCH[2]}
-            # Missing files are never suppressed by the exceptions file.
-            printf 'MISSING\t%s\t%s\n' \
-                "$(sanitize_text "$package_name")" \
-                "$(sanitize_text "$file_path")" >> "$findings_file"
+            # Modified-file exceptions never suppress a missing file.
+            if missing_path_is_approved "$file_path"; then
+                printf 'APPROVED\t%s\t%s\n' \
+                    "$(sanitize_text "$package_name")" \
+                    "$(sanitize_text "$file_path")" >> "$ignored_findings_file"
+                include_diagnostic=0
+            else
+                printf 'MISSING\t%s\t%s\n' \
+                    "$(sanitize_text "$package_name")" \
+                    "$(sanitize_text "$file_path")" >> "$findings_file"
+            fi
         elif [[ $line =~ ^debsums:\ changed\ file\ (.*)\ \(from\ (.*)\ package\)$ ]]; then
             file_path=${BASH_REMATCH[1]}
             package_name=${BASH_REMATCH[2]}
@@ -2737,6 +2839,7 @@ build_package_findings() {
     changed_count=$(grep -c '^CHANGED' "$findings_file" || true)
     missing_count=$(grep -c '^MISSING' "$findings_file" || true)
     ignored_changed_count=$(grep -c '^IGNORED' "$ignored_findings_file" || true)
+    approved_missing_count=$(grep -c '^APPROVED' "$ignored_findings_file" || true)
     coverage_count=$(grep -c '.' "$coverage_safe_file" || true)
 }
 
@@ -2778,7 +2881,7 @@ assemble_finding_ledger() {
         case "$status" in
             MISSING|CHANGED) record_finding ALERT 'PACKAGE' "$detail" "$status $resource" ;;
             CONFIG|METADATA|UNKNOWN) record_finding WARNING 'PACKAGE' "$detail" "$status $resource" ;;
-            TIMESTAMP) record_finding NOTICE 'PACKAGE' "$detail" "$status $resource" ;;
+            TIMESTAMP|RUNTIME) record_finding NOTICE 'PACKAGE' "$detail" "$status $resource" ;;
         esac
     done < "$findings_file"
 
@@ -3037,7 +3140,7 @@ print_terminal_report() {
             'Missing package files:'*)
                 (( missing_count > 0 )) && line_color=$color_red || line_color=$color_green
                 ;;
-            'Expected changed files ignored:'*)
+            'Expected changed files ignored:'*|'Approved missing files ignored:'*)
                 (( ignored_changed_count > 0 )) && line_color=$color_green || line_color=''
                 ;;
             'Packages without checksum data:'*)
@@ -3339,6 +3442,10 @@ failure_context='loading exception rules'
 progress_start 'Loading exception rules'
 load_exception_patterns
 exception_status=$?
+if (( exception_status == 0 )); then
+    load_missing_exception_paths
+    exception_status=$?
+fi
 if (( exception_status != 0 )); then
     progress_finish failed
     exit "$exception_status"
@@ -3397,6 +3504,8 @@ rpm_unparsed_count=0
 rpm_timestamp_ignored_count=0
 rpm_ghost_skipped_count=0
 rpm_unverifiable_count=0
+rpm_runtime_dir_notice_count=0
+approved_missing_count=0
 coverage_status=0
 changed_count=0
 missing_count=0
@@ -3533,7 +3642,7 @@ if (( changed_count + missing_count > 0 )); then
     progress_finish failed
 elif (( package_warning_count > 0 )); then
     progress_finish warning
-elif (( ignored_changed_count + coverage_count + package_notice_count > 0 )); then
+elif (( ignored_changed_count + approved_missing_count + coverage_count + package_notice_count > 0 )); then
     progress_finish notice
 else
     progress_finish done
@@ -3586,7 +3695,7 @@ else
         2)
             if (( changed_count + missing_count > 0 )); then
                 mismatch_found=1
-            elif (( ignored_changed_count == 0 )); then
+            elif (( ignored_changed_count + approved_missing_count == 0 )); then
                 execution_error=1
                 (( final_exit_status == 0 )) && final_exit_status=1
                 printf 'debsums reported mismatches, but no recognized findings were parsed.\n' \
@@ -3677,6 +3786,7 @@ change_message=''
     printf 'Kernel log lookback:            %s\n' "$(sanitize_text "$KERNEL_LOG_SINCE")"
     printf 'Exceptions file:                %s\n' "$(sanitize_text "$EXCEPTIONS_FILE")"
     printf 'Exception patterns loaded:      %s\n' "$exception_pattern_count"
+    printf 'Approved-missing paths loaded:  %s\n' "$missing_exception_count"
     printf 'Package backend:                 %s\n' "$PACKAGE_BACKEND"
     printf 'Package verifier exit code:      %s\n' "$package_verify_status"
     printf '\n'
@@ -3757,10 +3867,12 @@ change_message=''
     printf 'Changed package files:          %s\n' "$changed_count"
     printf 'Package config/metadata warnings: %s\n' "$package_warning_count"
     if [[ $PACKAGE_BACKEND == rpm ]]; then
+        printf 'RPM runtime directories absent: %s (NOTICE)\n' "$rpm_runtime_dir_notice_count"
         printf 'RPM timestamp-only skipped:     %s\n' "$rpm_timestamp_ignored_count"
         printf 'RPM unparsed records:           %s\n' "$rpm_unparsed_count"
     fi
     printf 'Missing package files:          %s\n' "$missing_count"
+    printf 'Approved missing files ignored: %s\n' "$approved_missing_count"
     printf 'Expected changed files ignored: %s\n' "$ignored_changed_count"
     printf 'Packages without checksum data: %s\n' "$coverage_count"
     printf 'Automatic system changes:       %s\n' "$automatic_change_count"
