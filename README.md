@@ -2,7 +2,7 @@
 
 Linux package-integrity, storage-health, and filesystem auditing, with terminal and optional multipart email reporting.
 
-> **Development preview:** `2.0.0-dev.7` implements both Debian/Ubuntu (`debsums`) and Rocky Linux/RHEL (`rpm`) package-integrity backends. Regression fixtures pass, and one Rocky Linux 9.8 host has completed a live audit. **Broader Rocky/RHEL host validation and production certification remain pending**. Do not treat this branch as a certified production release. The existing `debsums-audit` v1.7.1 remains the known-working Ubuntu baseline.
+> **Development preview:** `2.0.0-dev.8` implements both Debian/Ubuntu (`debsums`) and Rocky Linux/RHEL (`rpm`) package-integrity backends. Regression fixtures pass, and one Rocky Linux 9.8 host has completed a live audit. **Broader Rocky/RHEL host validation and production certification remain pending**. Do not treat this branch as a certified production release. The existing `debsums-audit` v1.7.1 remains the known-working Ubuntu baseline.
 
 ## Platform support
 
@@ -72,18 +72,31 @@ sudo env REPORT_TO="admin@example.org" FORCE_REPORT=1 ./system-integrity-audit
 
 `REPORT_FROM_NAME`, `REPORT_FROM_ADDRESS`, and `SUBJECT_PREFIX` customize sender and subject settings. No organization-specific email address is embedded in the repository.
 
-## Safe host defaults
+## Automatic host changes (enabled by default since v2.0.0-dev.8)
 
-`AUTO_INSTALL_REQUIREMENTS=0` and `AUTO_ENABLE_PERSISTENT_JOURNAL=0` are defaults: no automatic package installation (APT or DNF) and no automatic persistent-journald configuration changes. The audit writes private lock, temp, and notification-state files; many checks require root. Automatic installation can be explicitly enabled, but **do not enable it on an unfamiliar system without reviewing the actions first**.
+**Both switches now default to `1`:**
 
-The initial live-audit configuration on a Rocky Linux host can be:
+```bash
+AUTO_INSTALL_REQUIREMENTS=1
+AUTO_ENABLE_PERSISTENT_JOURNAL=1
+```
+
+When run with sufficient privileges, the audit **may install missing prerequisites using APT (Debian/Ubuntu) or DNF (RPM systems)** and **may configure/restart journald to enable persistent kernel logs when necessary**. These are conditional actions: setting `1` does not force a package transaction or journal change when everything is already configured. The audit also creates private lock, temporary, and state files, and the default SMART short-test scheduler may start a non-captive drive self-test under its strict eligibility gates. **Review the script and these side effects before running it as root on a production host.**
+
+For the new default behavior, with email disabled:
+
+```bash
+sudo env REPORT_TO=username@email.address FORCE_REPORT=1 ./system-integrity-audit
+```
+
+To **disable both automatic host changes** for a cautious first run or unattended use where host modifications are not approved:
 
 ```bash
 sudo env AUTO_INSTALL_REQUIREMENTS=0 AUTO_ENABLE_PERSISTENT_JOURNAL=0 \
   REPORT_TO=username@email.address FORCE_REPORT=1 ./system-integrity-audit
 ```
 
-This avoids automatic package/journald changes and email, but does not disable all local writes (locks and notification state).
+The controls are independent: set either to `0` to disable just that action. Neither setting disables local lock/state writes or SMART self-test initiation; use `SMART_SHORT_TEST_AUTO=0` separately to opt out of firmware tests. The placeholder `REPORT_TO` still disables email.
 
 ## Development tests
 
