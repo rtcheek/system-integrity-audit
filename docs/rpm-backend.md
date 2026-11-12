@@ -1,6 +1,6 @@
 # Rocky Linux / RHEL RPM backend (development preview)
 
-The `develop/v2.0` branch now recognizes `ID=rocky`, `ID=rhel`, `ID=almalinux`, and `ID=centos` from `/etc/os-release`. This is **not certification** of any specific major release. Version `2.0.0-dev.6` has passed mock-based regression tests, and one real Rocky Linux 9.8 host has completed an audit. This is **not yet broad Rocky/RHEL compatibility certification**.
+The `develop/v2.0` branch now recognizes `ID=rocky`, `ID=rhel`, `ID=almalinux`, and `ID=centos` from `/etc/os-release`. This is **not certification** of any specific major release. Version `2.0.0-dev.7` has passed mock-based regression tests, and one real Rocky Linux 9.8 host has completed an audit. This is **not yet broad Rocky/RHEL compatibility certification**.
 
 ## Verification
 
@@ -48,20 +48,20 @@ AUTO_ENABLE_PERSISTENT_JOURNAL=0
 REPORT_TO="username@email.address"
 ```
 
-These defaults prevent automatic package installation, journald configuration changes, and outgoing email. The script still creates temporary, lock, and optional local state files during an audit.
+These defaults prevent automatic package installation, journald configuration changes, and outgoing email. The script still creates temporary, lock, and optional local state files during an audit. **SMART_SHORT_TEST_AUTO=1 is a separate default in v2.0.0-dev.7**: a short, non-captive firmware self-test may start under strict safety gates; opt out with SMART_SHORT_TEST_AUTO=0. See [SMART short-test scheduler](smart-short-tests.md).
 
 The normal command timeout applies to hardware checks; RPM has a separate `RPM_VERIFY_TIMEOUT_SECONDS` (default 7200). A verification timeout or failure must produce an incomplete result rather than a clean audit.
 
 ## Live Rocky host validation
 
-One Rocky Linux 9.8 host has successfully completed an audit and exposed realistic expected SGX changes and a transient Gluster directory. Continue testing with the regression suite, **then** run a reviewed audit without automatic changes or email:
+One Rocky Linux 9.8 host has successfully completed an audit and exposed realistic expected SGX changes and a transient Gluster directory. Continue testing with the regression suite, **then** run a reviewed audit without automatic package/journald changes, email or SMART test initiation:
 
 ```bash
 sudo bash tests/regression.sh
 sudo bash tests/rpm-regression.sh
 sudo env REPORT_TO=username@email.address \
   AUTO_INSTALL_REQUIREMENTS=0 AUTO_ENABLE_PERSISTENT_JOURNAL=0 \
-  FORCE_REPORT=1 ./system-integrity-audit
+  SMART_SHORT_TEST_AUTO=0 FORCE_REPORT=1 ./system-integrity-audit
 ```
 
 Review the terminal report's coverage summary, RPM classifications, and the kernel/filesystem sections. If there are unexpected alerts, use the native command `sudo rpm -Va --noscripts --noghost` for independent comparison. Redact machine-specific details before sharing.
