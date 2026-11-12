@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Non-destructive regression fixtures for system-integrity-audit 2.0.0-dev.5.
+# Non-destructive regression fixtures for system-integrity-audit 2.0.0-dev.6.
 # Run: bash tests/regression.sh [path/to/system-integrity-audit]
 set -euo pipefail
 SCRIPT=${1:-"$(dirname "$0")/../system-integrity-audit"}
@@ -352,7 +352,7 @@ MOCK_COVERAGE_MODE=normal
 export JOURNAL_TIMEOUT_SECONDS MOCK_COVERAGE_MODE
 pass 'coverage failures, empty history, short retention, and timeout handled safely'
 
-assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.5' 'embedded version'
+assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.6' 'embedded version'
 bash -n "$SCRIPT"
 pass 'version and Bash syntax'
 
@@ -360,7 +360,17 @@ pass 'version and Bash syntax'
 # the real report-builder/mail path and the preflight email trap, not host APT.
 cat > "$test_dir/bin/debsums" <<'EOF'
 #!/usr/bin/env bash
-case "$1" in -ca|-l) exit 0 ;; *) exit 2 ;; esac
+case "$1" in
+  -ca)
+    if [[ -n ${MOCK_DEBSUMS_DIAGNOSTICS_FILE:-} ]]; then
+      cat "$MOCK_DEBSUMS_DIAGNOSTICS_FILE" >&2
+      exit 2
+    fi
+    exit 0
+    ;;
+  -l) exit 0 ;;
+  *) exit 2 ;;
+esac
 EOF
 # The shared integration test simulates Ubuntu even when run on Rocky/RHEL.
 # A Rocky test runner normally has no dpkg-query; provide a deterministic
@@ -404,6 +414,7 @@ ENV_ARGS=(
     "STATEFUL_NOTIFICATIONS=1"
     "NOTIFICATION_STATE_FILE=$test_dir/integration-state.tsv"
     "EXCEPTIONS_FILE=$test_dir/nonexistent-exceptions"
+    "MISSING_EXCEPTIONS_FILE=$test_dir/nonexistent-missing-exceptions"
     "LOCK_FILE=$test_dir/integration-lock"
     "REPORT_COVERAGE_GAPS=0"
     "FORCE_REPORT=1"
@@ -422,7 +433,7 @@ assert_eq "$rc" 0 'full clean report exit success'
 grep -q 'Subject: .* TEST/OK - ' "$test_dir/last-email.eml" || fail 'clean status subject'
 grep -q '^From: "System Integrity Audit" <system-integrity-audit>' "$test_dir/last-email.eml" || fail 'visible From header'
 grep -q 'Audit coverage' "$test_dir/last-email.eml" || fail 'coverage section missing'
-grep -q 'Script version: *2.0.0-dev.5' "$test_dir/last-email.eml" || fail 'version absent in report'
+grep -q 'Script version: *2.0.0-dev.6' "$test_dir/last-email.eml" || fail 'version absent in report'
 [[ -f $test_dir/integration-state.tsv ]] || fail 'state file not persisted'
 pass 'full clean report, MIME sender, coverage, state persistence'
 
@@ -454,6 +465,40 @@ grep -q 'Package-file verification: *COMPLETED' "$test_dir/focal-stdout" || fail
 grep -q 'Kernel event review: *COMPLETED' "$test_dir/focal-stdout" || fail 'Focal kernel journal coverage incomplete'
 [[ ! -e $test_dir/last-email.eml ]] || fail 'Focal placeholder unexpectedly sent email'
 pass 'Ubuntu 20.04 end-to-end audit and mail placeholder'
+
+# An exact missing-file approval works on Debian/Ubuntu too. It does not
+# inherit modification globs or hide unrelated missing package payloads.
+printf '%s\n' '/usr/lib/expected-missing.so' > "$test_dir/debian-approved-missing.txt"
+cat > "$test_dir/debsums-missing.out" <<'EOF'
+debsums: missing file /usr/lib/expected-missing.so (from fixture package)
+debsums: missing file /usr/lib/unrelated-missing.so (from fixture package)
+EOF
+env "${ENV_ARGS[@]}" "REPORT_TO=username@email.address" \
+    "MOCK_DEBSUMS_DIAGNOSTICS_FILE=$test_dir/debsums-missing.out" \
+    "MISSING_EXCEPTIONS_FILE=$test_dir/debian-approved-missing.txt" \
+    "STATEFUL_NOTIFICATIONS=0" \
+    "NOTIFICATION_STATE_FILE=$test_dir/debian-missing-state.tsv" \
+    "TERMINAL_OUTPUT=always" \
+    bash "$test_dir/integration.sh" > "$test_dir/debian-missing.stdout" 2> "$test_dir/debian-missing.stderr"
+rc=$?
+assert_eq "$rc" 0 'Debian explicit missing exceptions run is not an execution error'
+grep -q 'APPROVED.*expected-missing.so' "$test_dir/debian-missing.stdout" || fail 'Debian explicit missing exception not displayed'
+grep -q 'MISSING.*unrelated-missing.so' "$test_dir/debian-missing.stdout" || fail 'Debian unrelated missing file wrongly suppressed'
+grep -q 'Approved missing files ignored: 1' "$test_dir/debian-missing.stdout" || fail 'Debian approved missing counter inaccurate'
+pass 'Debian/Ubuntu exact missing exception does not hide unrelated missing files'
+
+# Ordinary modification exceptions, including globs, cannot hide missing
+# Debian package files without an explicit exact-path approval.
+printf '/usr/lib/*.so\n' > "$test_dir/debian-modifications.ignore"
+env "${ENV_ARGS[@]}" "REPORT_TO=username@email.address" \
+    "MOCK_DEBSUMS_DIAGNOSTICS_FILE=$test_dir/debsums-missing.out" \
+    "EXCEPTIONS_FILE=$test_dir/debian-modifications.ignore" \
+    "STATEFUL_NOTIFICATIONS=0" "TERMINAL_OUTPUT=always" \
+    bash "$test_dir/integration.sh" > "$test_dir/debian-regular-exceptions.stdout" 2> "$test_dir/debian-regular-exceptions.stderr"
+rc=$?
+assert_eq "$rc" 0 'Debian modification-only exception run exits normally'
+grep -q 'MISSING.*expected-missing.so' "$test_dir/debian-regular-exceptions.stdout" || fail 'Debian missing file was hidden by modifications glob'
+pass 'Debian/Ubuntu modification globs cannot hide missing files'
 
 # An older Ubuntu release must not be passed off as supported.
 printf 'ID=ubuntu\nVERSION_ID="18.04"\n' > "$test_dir/ubuntu18-os-release"
@@ -524,7 +569,7 @@ pass 'placeholder disables early-failure email'
 
 # RPM distributions are no longer blocked at initialization. A separate
 # regression script validates their full package and reporting lifecycle.
-assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.5' 'v2 development version'
+assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.6' 'v2 development version'
 pass 'RPM backend enabled in development release'
 
 # Probe timeout must return 124, and never silently claim the check succeeded.
