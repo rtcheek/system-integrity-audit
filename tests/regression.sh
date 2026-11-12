@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Non-destructive regression fixtures for system-integrity-audit 2.0.0-dev.2.
+# Non-destructive regression fixtures for system-integrity-audit 2.0.0-dev.3.
 # Run: bash tests/regression.sh [path/to/system-integrity-audit]
 set -euo pipefail
 SCRIPT=${1:-"$(dirname "$0")/../system-integrity-audit"}
@@ -318,7 +318,7 @@ MOCK_COVERAGE_MODE=normal
 export JOURNAL_TIMEOUT_SECONDS MOCK_COVERAGE_MODE
 pass 'coverage failures, empty history, short retention, and timeout handled safely'
 
-assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.2' 'embedded version'
+assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.3' 'embedded version'
 bash -n "$SCRIPT"
 pass 'version and Bash syntax'
 
@@ -368,7 +368,7 @@ assert_eq "$rc" 0 'full clean report exit success'
 grep -q 'Subject: .* TEST/OK - ' "$test_dir/last-email.eml" || fail 'clean status subject'
 grep -q '^From: "System Integrity Audit" <system-integrity-audit>' "$test_dir/last-email.eml" || fail 'visible From header'
 grep -q 'Audit coverage' "$test_dir/last-email.eml" || fail 'coverage section missing'
-grep -q 'Script version: *2.0.0-dev.2' "$test_dir/last-email.eml" || fail 'version absent in report'
+grep -q 'Script version: *2.0.0-dev.3' "$test_dir/last-email.eml" || fail 'version absent in report'
 [[ -f $test_dir/integration-state.tsv ]] || fail 'state file not persisted'
 pass 'full clean report, MIME sender, coverage, state persistence'
 
@@ -429,14 +429,10 @@ assert_eq "$rc" 65 'placeholder early failure exit'
 [[ ! -e $test_dir/last-email.eml ]] || fail 'placeholder sent early-failure email'
 pass 'placeholder disables early-failure email'
 
-# RPM hosts should fail explicitly, not execute apt/debsums commands.
-printf 'ID=rocky\n' > "$test_dir/rocky-os-release"
-env "${ENV_ARGS[@]}" "REPORT_TO=" "OS_RELEASE_FILE=$test_dir/rocky-os-release" \
-    bash "$test_dir/integration.sh" > "$test_dir/rocky-stdout" 2> "$test_dir/rocky-stderr"
-rc=$?
-assert_eq "$rc" 78 'RPM host must be rejected until the backend is ready'
-grep -q 'RPM package-integrity backend is not implemented' "$test_dir/rocky-stderr" || fail 'no explicit RPM limitation'
-pass 'RPM platform guard prevents misleading verification'
+# RPM distributions are no longer blocked at initialization. A separate
+# regression script validates their full package and reporting lifecycle.
+assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.3' 'v2 development version'
+pass 'RPM backend enabled in development release'
 
 # Probe timeout must return 124, and never silently claim the check succeeded.
 run_probe 1 sleep 2 > "$test_dir/timeout-out" 2> "$test_dir/timeout-err"
