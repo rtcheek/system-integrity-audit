@@ -1,6 +1,6 @@
 # Rocky Linux / RHEL RPM backend (development preview)
 
-The `develop/v2.0` branch now recognizes `ID=rocky`, `ID=rhel`, `ID=almalinux`, and `ID=centos` from `/etc/os-release`. This is **not certification** of any specific major release. Version `2.0.0-dev.3` has passed mock-based regression tests but has **not yet been tested against a real Rocky/RHEL host**.
+The `develop/v2.0` branch now recognizes `ID=rocky`, `ID=rhel`, `ID=almalinux`, and `ID=centos` from `/etc/os-release`. This is **not certification** of any specific major release. Version `2.0.0-dev.6` has passed mock-based regression tests, and one real Rocky Linux 9.8 host has completed an audit. This is **not yet broad Rocky/RHEL compatibility certification**.
 
 ## Verification
 
@@ -14,7 +14,8 @@ It uses the installed RPM database as the comparison baseline. RPM returns statu
 
 | RPM result | Default audit interpretation |
 | --- | --- |
-| Missing ordinary package-managed file | `MISSING` / ALERT |
+| Missing ordinary package-managed file | `MISSING` / ALERT, unless explicitly approved as an exact missing path |
+| Missing RPM-owned `/run` directory | `RUNTIME` / NOTICE, **only** if `rpm -q --dump` confirms the exact missing path is a directory; otherwise ALERT |
 | Changed size, checksum, or symlink target on ordinary payload | `CHANGED` / ALERT |
 | Modified `%config` file | `CONFIG` / WARNING |
 | Permissions, ownership, capabilities, other metadata differences | `METADATA` / WARNING |
@@ -23,7 +24,16 @@ It uses the installed RPM database as the comparison baseline. RPM returns statu
 | Unreadable, unrecognized verification record | Incomplete/error reporting |
 | RPM execution failure or unexpected status | Incomplete/error reporting |
 
-The original `debsums` backend is retained for Debian/Ubuntu. Missing package files are **not exempted** by custom expected-change exception patterns, so exceptions cannot conceal missing package payloads. Other expected changes can use the existing `EXCEPTIONS_FILE` glob format.
+The original `debsums` backend is retained for Debian/Ubuntu. Its modifications-exception list, `EXCEPTIONS_FILE`, does **not** hide missing package payloads. An administrator can explicitly approve a known missing path via `MISSING_EXCEPTIONS_FILE`. This is a separate file with *literal exact-path matching*, not globbing. Approvals are listed with status `APPROVED` under **Expected package verification differences ignored**, and counted separately in the summary.
+
+Default files:
+
+- `/usr/local/etc/system-integrity-audit.ignore`: known **modified** paths; shell globs allowed.
+- `/usr/local/etc/system-integrity-audit.missing.ignore`: explicitly approved **missing** paths; one exact absolute path per line, with `#` comments and no globs.
+
+Example: `/var/opt/aesmd/data/white_list_cert_to_be_verify.bin` may be locally removed as part of a custom Intel SGX install, but should **not** be globally suppressed for other hosts. For a host with that known modification, add only that exact path to its approved-missing file. Secure the file with root ownership and mode `0600`.
+
+For `/run` paths, the runtime-directory downgrade is **fail closed**: if the owner lookup or `rpm --dump` check cannot establish a directory file type, the missing path remains an alert. Missing regular files under `/run` always remain alerts unless explicitly approved.
 
 Some RPM output variations and package types may produce noisy records; please report redacted examples for refinement.
 
@@ -42,9 +52,9 @@ These defaults prevent automatic package installation, journald configuration ch
 
 The normal command timeout applies to hardware checks; RPM has a separate `RPM_VERIFY_TIMEOUT_SECONDS` (default 7200). A verification timeout or failure must produce an incomplete result rather than a clean audit.
 
-## First real Rocky host validation
+## Live Rocky host validation
 
-Start with the regression suite, **then** run one carefully reviewed audit without automatic changes or email:
+One Rocky Linux 9.8 host has successfully completed an audit and exposed realistic expected SGX changes and a transient Gluster directory. Continue testing with the regression suite, **then** run a reviewed audit without automatic changes or email:
 
 ```bash
 sudo bash tests/regression.sh
