@@ -1,6 +1,6 @@
 # Rocky Linux / RHEL RPM backend (development preview)
 
-The `develop/v2.0` branch now recognizes `ID=rocky`, `ID=rhel`, `ID=almalinux`, and `ID=centos` from `/etc/os-release`. This is **not certification** of any specific major release. Version `2.0.0-dev.7` has passed mock-based regression tests, and one real Rocky Linux 9.8 host has completed an audit. This is **not yet broad Rocky/RHEL compatibility certification**.
+The `develop/v2.0` branch now recognizes `ID=rocky`, `ID=rhel`, `ID=almalinux`, and `ID=centos` from `/etc/os-release`. This is **not certification** of any specific major release. Version `2.0.0-dev.8` has passed mock-based regression tests, and one real Rocky Linux 9.8 host has completed an audit. This is **not yet broad Rocky/RHEL compatibility certification**.
 
 ## Verification
 
@@ -39,16 +39,17 @@ Some RPM output variations and package types may produce noisy records; please r
 
 ## Prerequisites and safety
 
-The RPM backend requires `rpm`. SMART checks additionally require `smartctl` from `smartmontools`. `dnf` is only required if `AUTO_INSTALL_REQUIREMENTS=1` is explicitly requested and packages are absent.
+The RPM backend requires `rpm`. SMART checks additionally require `smartctl` from `smartmontools`. `dnf` is used for automatic installation when required audit prerequisites are missing and installation is enabled. Since v2.0.0-dev.8, this is enabled by default; installing packages still requires sufficient privileges.
 
-By default:
+By default (since v2.0.0-dev.8):
+
 ```bash
-AUTO_INSTALL_REQUIREMENTS=0
-AUTO_ENABLE_PERSISTENT_JOURNAL=0
+AUTO_INSTALL_REQUIREMENTS=1
+AUTO_ENABLE_PERSISTENT_JOURNAL=1
 REPORT_TO="username@email.address"
 ```
 
-These defaults prevent automatic package installation, journald configuration changes, and outgoing email. The script still creates temporary, lock, and optional local state files during an audit. **SMART_SHORT_TEST_AUTO=1 is a separate default in v2.0.0-dev.7**: a short, non-captive firmware self-test may start under strict safety gates; opt out with SMART_SHORT_TEST_AUTO=0. See [SMART short-test scheduler](smart-short-tests.md).
+**Running as root can now install missing packages with DNF and configure or restart journald automatically if persistent logging is not already enabled.** The switches only permit changes when needed; they do not force a transaction on an already configured host. Set either switch to `0` to opt out of that action. The placeholder email recipient still disables outgoing mail. The script creates temporary, lock, and local state files. **SMART_SHORT_TEST_AUTO=1 is a separate default introduced in v2.0.0-dev.7**: a non-captive firmware test may start under strict eligibility gates; opt out with `SMART_SHORT_TEST_AUTO=0`. See [SMART short-test scheduler](smart-short-tests.md).
 
 The normal command timeout applies to hardware checks; RPM has a separate `RPM_VERIFY_TIMEOUT_SECONDS` (default 7200). A verification timeout or failure must produce an incomplete result rather than a clean audit.
 
@@ -72,5 +73,5 @@ Review the terminal report's coverage summary, RPM classifications, and the kern
 - RPM payload verification does not assess unowned files, network-mounted data, application semantics, SELinux policy correctness, or runtime malware.
 - Some RPM metadata differences are benign and need site-specific review.
 - RHEL/Rocky versions may differ in packaged scrub timers, service units, and default journald policies; these shared checks require real-host verification.
-- The dedicated DNF installation path is opt-in and has not been validated in a live package transaction.
+- The dedicated DNF installation path is enabled by default when prerequisites are missing but has not been validated in a live package transaction; administrators should review host-change permissions.
 - No deployment or signing key should be inferred from the repository. Review scripts before running as root.
