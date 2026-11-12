@@ -2,19 +2,21 @@
 
 Linux package-integrity, storage-health, and filesystem auditing, with terminal and optional multipart email reporting.
 
-> **Development preview:** `2.0.0-dev.3` implements both Debian/Ubuntu (`debsums`) and Rocky Linux/RHEL (`rpm`) package-integrity backends. Regression fixtures pass, but **real Rocky/RHEL host validation is still pending**. Do not treat this branch as a certified production release. The existing `debsums-audit` v1.7.1 remains the known-working Ubuntu baseline.
+> **Development preview:** `2.0.0-dev.4` implements both Debian/Ubuntu (`debsums`) and Rocky Linux/RHEL (`rpm`) package-integrity backends. Regression fixtures pass, but **real Rocky/RHEL host validation is still pending**. Do not treat this branch as a certified production release. The existing `debsums-audit` v1.7.1 remains the known-working Ubuntu baseline.
 
 ## Platform support
 
 | OS family | Package verification | Validation |
 | --- | --- | --- |
-| Ubuntu 22.04/24.04 | `debsums -ca` and `debsums -l` | Preserved Ubuntu regression suite; v2 live validation pending |
+| Ubuntu 20.04 LTS | `debsums -ca` and `debsums -l` | systemd 245, journald, and end-to-end mock regressions pass; live host validation pending |
+| Ubuntu 22.04/24.04 LTS | `debsums -ca` and `debsums -l` | Preserved Ubuntu regression suite; v2 live validation pending |
+| Ubuntu 18.04 and earlier | Not supported | Rejected explicitly; minimum Ubuntu release is 20.04 |
 | Debian | `debsums` | Experimental |
 | Rocky Linux / RHEL 9 | `rpm -Va --noscripts --noghost` | Simulated Rocky/RHEL regressions pass; live host validation pending |
 | AlmaLinux / CentOS | RPM backend selected | Experimental; not certified |
 | Rocky Linux / RHEL 8 and 10 | RPM backend selected | Experimental; compatibility testing pending |
 
-A platform recognized by the script is **not** automatically a tested platform. Unsupported distributions are rejected explicitly.
+A platform recognized by the script is **not** automatically a tested platform. Ubuntu 20.04's `journalctl` lacks `--lines=+1`; the audit uses a timeout-bounded first-entry stream instead. See [Ubuntu 20.04 compatibility notes](docs/ubuntu2004-compatibility.md). Ubuntu 18.04 and earlier are rejected explicitly.
 
 ## Package-integrity interpretation
 
