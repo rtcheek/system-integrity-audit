@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# system-integrity-audit version 2.0.0-dev.7
+# system-integrity-audit version 2.0.0-dev.8
 # DEVELOPMENT PREVIEW: Debian/Ubuntu and Rocky/RHEL RPM backends.
 # Audit kernel/storage health and native package-managed file integrity.
 
@@ -12,10 +12,13 @@ export PATH
 export LC_ALL=C
 
 PROGRAM_NAME='system-integrity-audit'
-PROGRAM_VERSION='2.0.0-dev.7'
+PROGRAM_VERSION='2.0.0-dev.8'
 readonly PROGRAM_NAME PROGRAM_VERSION
 
 # Changelog:
+#   2.0.0-dev.8 (2026-11-12): Enable automatic prerequisite installation
+#                          and persistent journald setup by default. Both
+#                          remain individually opt-out environment settings.
 #   2.0.0-dev.7 (2026-11-12): Schedule conservative, non-captive SMART
 #                          short tests after 60 days with strict CPU/iowait
 #                          gates; show subsequent logged results and skips.
@@ -170,10 +173,10 @@ FORCE_REPORT="${FORCE_REPORT:-0}"
 TERMINAL_OUTPUT="${TERMINAL_OUTPUT:-auto}"
 PROGRESS_OUTPUT="${PROGRESS_OUTPUT:-auto}"
 LOCK_FILE="${LOCK_FILE:-/run/lock/system-integrity-audit.lock}"
-AUTO_INSTALL_REQUIREMENTS="${AUTO_INSTALL_REQUIREMENTS:-0}"
+AUTO_INSTALL_REQUIREMENTS="${AUTO_INSTALL_REQUIREMENTS:-1}"
 SMART_CHECK_ENABLED="${SMART_CHECK_ENABLED:-1}"
 KERNEL_LOG_CHECK_ENABLED="${KERNEL_LOG_CHECK_ENABLED:-1}"
-AUTO_ENABLE_PERSISTENT_JOURNAL="${AUTO_ENABLE_PERSISTENT_JOURNAL:-0}"
+AUTO_ENABLE_PERSISTENT_JOURNAL="${AUTO_ENABLE_PERSISTENT_JOURNAL:-1}"
 JOURNAL_PERSISTENCE_DROPIN="${JOURNAL_PERSISTENCE_DROPIN:-/etc/systemd/journald.conf.d/99-system-integrity-audit.conf}"
 KERNEL_LOG_SINCE="${KERNEL_LOG_SINCE:-7 days ago}"
 FILESYSTEM_CHECKS_ENABLED="${FILESYSTEM_CHECKS_ENABLED:-1}"
@@ -242,10 +245,10 @@ Environment overrides:
   TERMINAL_OUTPUT=auto|always|never Terminal report behavior
   PROGRESS_OUTPUT=auto|always|never Show startup and test progress
   NO_COLOR=1                        Disable ANSI terminal colors
-  AUTO_INSTALL_REQUIREMENTS=1       Explicitly allow package installation via apt/dnf
+  AUTO_INSTALL_REQUIREMENTS=0       Disable automatic installation via apt/dnf (default: 1)
   SMART_CHECK_ENABLED=0             Disable SMART checks
   KERNEL_LOG_CHECK_ENABLED=0        Disable kernel-log scan
-  AUTO_ENABLE_PERSISTENT_JOURNAL=1  Explicitly allow persistent journald setup
+  AUTO_ENABLE_PERSISTENT_JOURNAL=0  Disable automatic persistent journald setup (default: 1)
   JOURNAL_PERSISTENCE_DROPIN=path   Journald drop-in managed by this script
   KERNEL_LOG_SINCE='24 hours ago'   Kernel-log lookback period
   FILESYSTEM_CHECKS_ENABLED=0       Disable filesystem/RAID/capacity checks
