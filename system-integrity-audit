@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# system-integrity-audit version 2.0.0-dev.3
+# system-integrity-audit version 2.0.0-dev.4
 # DEVELOPMENT PREVIEW: Debian/Ubuntu and Rocky/RHEL RPM backends.
 # Audit kernel/storage health and native package-managed file integrity.
 
@@ -12,10 +12,14 @@ export PATH
 export LC_ALL=C
 
 PROGRAM_NAME='system-integrity-audit'
-PROGRAM_VERSION='2.0.0-dev.3'
+PROGRAM_VERSION='2.0.0-dev.4'
 readonly PROGRAM_NAME PROGRAM_VERSION
 
 # Changelog:
+#   2.0.0-dev.4 (2026-11-12): Add Ubuntu 20.04 LTS (systemd 245)
+#                          compatibility coverage, retain bounded legacy
+#                          kernel journal queries, and reject Ubuntu
+#                          releases older than 20.04 as unvalidated.
 #   2.0.0-dev.3 (2026-11-12): Add RPM verification backend for Rocky/RHEL,
 #                          DNF prerequisite installation, native RPM lock
 #                          handling, safe RPM result classification, and
@@ -206,6 +210,8 @@ case "${1:-}" in
     --help|-h)
         cat <<USAGE
 Usage: $PROGRAM_NAME [--version|--help]
+
+Ubuntu compatibility targets: 20.04, 22.04, 24.04 LTS (18.04 not supported)
 
 Environment overrides:
   REPORT_TO=address                 Email recipient (default: username@email.address)
@@ -1229,7 +1235,8 @@ check_kernel_log_coverage() {
     kernel_coverage_summary='unknown (kernel journal history unavailable)'
     # journalctl --lines=+1 selects the oldest matching event on systemd 255+
     # (Ubuntu 24.04), avoiding a complete export of retained kernel history.
-    # Ubuntu 22.04's systemd 249 lacks +N: stream just one line via head.
+    # Ubuntu 20.04's systemd 245 and 22.04's 249 lack +N: stream the
+    # oldest matching entry through head without exporting full history.
     # The legacy producer may exit 141 (SIGPIPE) when head closes the pipe;
     # accept that *only* if a valid first line was captured. Other errors,
     # including probe timeouts, must not be mistaken for usable coverage.
@@ -3157,7 +3164,22 @@ fi
 # shellcheck disable=SC1090
 . "$OS_RELEASE_FILE"
 case "${ID:-}" in
-    ubuntu|debian)
+    ubuntu)
+        # The 20.04 LTS (Focal) systemd 245 and util-linux toolchain are the
+        # oldest Ubuntu baseline covered by this project's regression tests.
+        # Refuse older releases instead of silently claiming audit coverage.
+        if [[ ${VERSION_ID:-} =~ ^([0-9]+)\.[0-9]+$ ]]; then
+            ubuntu_major_version=$((10#${BASH_REMATCH[1]}))
+            if (( ubuntu_major_version < 20 )); then
+                printf '%s: Ubuntu %s is not supported; minimum Ubuntu release is 20.04 LTS.\n' \
+                    "$PROGRAM_NAME" "$VERSION_ID" >&2
+                exit 78
+            fi
+        fi
+        PACKAGE_BACKEND=dpkg
+        PACKAGE_VERIFY_TOOL=debsums
+        ;;
+    debian)
         PACKAGE_BACKEND=dpkg
         PACKAGE_VERIFY_TOOL=debsums
         ;;
