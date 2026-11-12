@@ -1,49 +1,69 @@
 # System Integrity Audit
 
-Linux package-integrity, storage-health, and filesystem auditing, with optional terminal and email reporting.
+Linux package-integrity, storage-health, and filesystem auditing, with terminal and optional multipart email reporting.
 
-> **Development preview:** v2.0.0-dev.2 on the [development branch](https://github.com/rtcheek/system-integrity-audit/tree/develop/v2.0) is **Debian/Ubuntu-only**. The RPM verification backend for Rocky Linux/RHEL is planned but **not yet implemented**. Do not treat this repository as a production-ready v2.0 release.
+> **Development preview:** `2.0.0-dev.3` implements both Debian/Ubuntu (`debsums`) and Rocky Linux/RHEL (`rpm`) package-integrity backends. Regression fixtures pass, but **real Rocky/RHEL host validation is still pending**. Do not treat this branch as a certified production release. The existing `debsums-audit` v1.7.1 remains the known-working Ubuntu baseline.
 
-## Email configuration
+## Platform support
 
-Email reporting is **included**, but disabled by the default placeholder:
+| OS family | Package verification | Validation |
+| --- | --- | --- |
+| Ubuntu 22.04/24.04 | `debsums -ca` and `debsums -l` | Preserved Ubuntu regression suite; v2 live validation pending |
+| Debian | `debsums` | Experimental |
+| Rocky Linux / RHEL 9 | `rpm -Va --noscripts --noghost` | Simulated Rocky/RHEL regressions pass; live host validation pending |
+| AlmaLinux / CentOS | RPM backend selected | Experimental; not certified |
+| Rocky Linux / RHEL 8 and 10 | RPM backend selected | Experimental; compatibility testing pending |
+
+A platform recognized by the script is **not** automatically a tested platform. Unsupported distributions are rejected explicitly.
+
+## Package-integrity interpretation
+
+On RPM systems, the script performs **read-only verification** of installed RPM package files. It classifies missing or changed package payloads as alerts; modified configuration files and metadata as warnings; and ignores timestamp-only drift unless `RPM_REPORT_TIMESTAMP_ONLY=1` is set. `%ghost` runtime files are skipped. Unreadable or unrecognized verification records and RPM command failures cause **incomplete/error** reporting, not a false all-clear. Expected changed paths may be configured as exceptions, but **missing package files are never suppressed by exceptions**.
+
+The RPM scan calls `rpm -Va --noscripts --noghost` with a timeout. Verification uses the installed package database as its reference; it is not a proof of system integrity against a compromised or modified RPM database. See [RPM backend notes](docs/rpm-backend.md) for limitations.
+
+## Email reporting
+
+Email delivery is available, but disabled by the exact default placeholder:
 
 ```bash
 REPORT_TO="username@email.address"
 ```
 
-If `REPORT_TO` equals that exact placeholder, or is empty, **no email is sent**, including early error reports. The audit can still print its terminal report. To enable email, configure a real recipient on a machine with a working sendmail-compatible mail transfer agent:
+An unchanged placeholder or empty `REPORT_TO` means **no email is sent**, including error notifications. To enable sending, configure a real recipient and a working sendmail-compatible local mailer:
 
 ```bash
 sudo env REPORT_TO="admin@example.org" FORCE_REPORT=1 ./system-integrity-audit
 ```
 
-The sender display name, envelope address, and subject prefix can be customized through `REPORT_FROM_NAME`, `REPORT_FROM_ADDRESS`, and `SUBJECT_PREFIX`. No campus-specific or organization-specific recipient address is embedded in this code.
+`REPORT_FROM_NAME`, `REPORT_FROM_ADDRESS`, and `SUBJECT_PREFIX` customize sender and subject settings. No organization-specific email address is embedded in the repository.
 
 ## Safe host defaults
 
-Automatic prerequisite installation (`AUTO_INSTALL_REQUIREMENTS=0`) and automatic persistent-journal changes (`AUTO_ENABLE_PERSISTENT_JOURNAL=0`) are **off** by default. Checks may still create local lock, temporary, and notification-state files. Many hardware and system-integrity checks require root privileges.
+`AUTO_INSTALL_REQUIREMENTS=0` and `AUTO_ENABLE_PERSISTENT_JOURNAL=0` are defaults: no automatic package installation (APT or DNF) and no automatic persistent-journald configuration changes. The audit writes private lock, temp, and notification-state files; many checks require root. Automatic installation can be explicitly enabled, but **do not enable it on an unfamiliar system without reviewing the actions first**.
 
-## Development and testing
+The initial live-audit configuration on a Rocky Linux host can be:
 
-To inspect the development preview and run its non-destructive mock-based regression tests:
+```bash
+sudo env AUTO_INSTALL_REQUIREMENTS=0 AUTO_ENABLE_PERSISTENT_JOURNAL=0 \
+  REPORT_TO=username@email.address FORCE_REPORT=1 ./system-integrity-audit
+```
+
+This avoids automatic package/journald changes and email, but does not disable all local writes (locks and notification state).
+
+## Development tests
 
 ```bash
 git checkout develop/v2.0
-bash tests/regression.sh
 bash ./system-integrity-audit --version
+sudo bash tests/regression.sh
+sudo bash tests/rpm-regression.sh
 ```
 
-Review `--help` and [the example configuration](config/example.env) before attempting a live audit. The regression suite mocks hardware, journals, and email; it does not constitute certification of a specific OS or controller.
+The regression suites use simulated hardware, journals, RPM results, and email. They cannot validate real device and storage behavior. Inspect the report's **Audit coverage** section and review all unexpected RPM differences on your actual machine before wider deployment.
 
-### Planned platforms
+See [example environment options](config/example.env). Suggestions and redacted false-positive examples are welcome through GitHub issues.
 
-- Ubuntu 22.04 and 24.04: existing v1.7.1 baseline, with v2 regression validation in progress.
-- Rocky Linux/RHEL 9: planned RPM package integrity adapter, not yet available.
-- Rocky Linux/RHEL 8 and 10: later validation targets.
+## Security and licensing
 
-## Security and contribution
-
-When opening issues or sharing logs, redact hostnames, usernames, disk serial numbers, network addresses, and other sensitive identifiers. Do not paste sensitive email settings or audit reports into public issues.
-
-Licensed under the [MIT License](LICENSE).
+Redact serial numbers, hostnames, usernames, addresses, and other private operational details before posting logs publicly. MIT license; see [LICENSE](LICENSE).
