@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Non-destructive regression fixtures for system-integrity-audit 2.0.0-dev.4.
+# Non-destructive regression fixtures for system-integrity-audit 2.0.0-dev.5.
 # Run: bash tests/regression.sh [path/to/system-integrity-audit]
 set -euo pipefail
 SCRIPT=${1:-"$(dirname "$0")/../system-integrity-audit"}
@@ -352,7 +352,7 @@ MOCK_COVERAGE_MODE=normal
 export JOURNAL_TIMEOUT_SECONDS MOCK_COVERAGE_MODE
 pass 'coverage failures, empty history, short retention, and timeout handled safely'
 
-assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.4' 'embedded version'
+assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.5' 'embedded version'
 bash -n "$SCRIPT"
 pass 'version and Bash syntax'
 
@@ -361,6 +361,18 @@ pass 'version and Bash syntax'
 cat > "$test_dir/bin/debsums" <<'EOF'
 #!/usr/bin/env bash
 case "$1" in -ca|-l) exit 0 ;; *) exit 2 ;; esac
+EOF
+# The shared integration test simulates Ubuntu even when run on Rocky/RHEL.
+# A Rocky test runner normally has no dpkg-query; provide a deterministic
+# stub instead of accidentally depending on the host's package manager.
+cat > "$test_dir/bin/dpkg-query" <<'EOF'
+#!/usr/bin/env bash
+if [[ ${1:-} == -S && ${2:-} == -- && $# -eq 3 ]]; then
+    printf 'fixture-package: %s\n' "$3"
+    exit 0
+fi
+printf 'unexpected mock dpkg-query arguments: %s\n' "$*" >&2
+exit 2
 EOF
 cat > "$test_dir/bin/sendmail" <<'EOF'
 #!/usr/bin/env bash
@@ -371,7 +383,11 @@ cat > "$test_dir/bin/logger" <<'EOF'
 #!/usr/bin/env bash
 exit 0
 EOF
-chmod +x "$test_dir/bin/debsums" "$test_dir/bin/sendmail" "$test_dir/bin/logger"
+chmod +x "$test_dir/bin/debsums" "$test_dir/bin/dpkg-query" "$test_dir/bin/sendmail" "$test_dir/bin/logger"
+# Verify the fake dpkg command is available and behaves predictably.
+assert_eq "$("$test_dir/bin/dpkg-query" -S -- /usr/bin/fixture)" \
+    'fixture-package: /usr/bin/fixture' 'portable dpkg-query fixture'
+pass 'cross-distribution Ubuntu dpkg-query fixture'
 cp "$SCRIPT" "$test_dir/integration.sh"
 # Only our sandbox copy may be changed: add the fake executable path first.
 sed -i "s@^PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'@PATH='$test_dir/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'@" \
@@ -397,12 +413,16 @@ ENV_ARGS=(
 printf 'ID=ubuntu\n' > "$test_dir/ubuntu-os-release"
 env "${ENV_ARGS[@]}" bash "$test_dir/integration.sh" > "$test_dir/integration-stdout" 2> "$test_dir/integration-stderr"
 rc=$?
+if (( rc != 0 )); then
+    printf 'Full integration audit exited %s. Captured stderr:\n' "$rc" >&2
+    sed -n '1,100p' "$test_dir/integration-stderr" >&2
+fi
 assert_eq "$rc" 0 'full clean report exit success'
 [[ -s $test_dir/last-email.eml ]] || fail 'full clean report email absent'
 grep -q 'Subject: .* TEST/OK - ' "$test_dir/last-email.eml" || fail 'clean status subject'
 grep -q '^From: "System Integrity Audit" <system-integrity-audit>' "$test_dir/last-email.eml" || fail 'visible From header'
 grep -q 'Audit coverage' "$test_dir/last-email.eml" || fail 'coverage section missing'
-grep -q 'Script version: *2.0.0-dev.4' "$test_dir/last-email.eml" || fail 'version absent in report'
+grep -q 'Script version: *2.0.0-dev.5' "$test_dir/last-email.eml" || fail 'version absent in report'
 [[ -f $test_dir/integration-state.tsv ]] || fail 'state file not persisted'
 pass 'full clean report, MIME sender, coverage, state persistence'
 
@@ -424,6 +444,10 @@ env "${ENV_ARGS[@]}" \
     "NOTIFICATION_STATE_FILE=$test_dir/focal-state.tsv" \
     bash "$test_dir/integration.sh" > "$test_dir/focal-stdout" 2> "$test_dir/focal-stderr"
 rc=$?
+if (( rc != 0 )); then
+    printf 'Focal integration audit exited %s. Captured stderr:\n' "$rc" >&2
+    sed -n '1,100p' "$test_dir/focal-stderr" >&2
+fi
 assert_eq "$rc" 0 'Focal full audit returned successful status'
 grep -q 'Ubuntu 20.04.6 LTS (fixture)' "$test_dir/focal-stdout" || fail 'Focal OS missing from report'
 grep -q 'Package-file verification: *COMPLETED' "$test_dir/focal-stdout" || fail 'Focal package audit incomplete'
@@ -500,7 +524,7 @@ pass 'placeholder disables early-failure email'
 
 # RPM distributions are no longer blocked at initialization. A separate
 # regression script validates their full package and reporting lifecycle.
-assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.4' 'v2 development version'
+assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.5' 'v2 development version'
 pass 'RPM backend enabled in development release'
 
 # Probe timeout must return 124, and never silently claim the check succeeded.
