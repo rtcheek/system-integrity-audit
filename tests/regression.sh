@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Non-destructive regression fixtures for system-integrity-audit 2.0.0-dev.7.
+# Non-destructive regression fixtures for system-integrity-audit 2.0.0-dev.8.
 # Run: bash tests/regression.sh [path/to/system-integrity-audit]
 set -euo pipefail
 SCRIPT=${1:-"$(dirname "$0")/../system-integrity-audit"}
@@ -521,7 +521,20 @@ MOCK_COVERAGE_MODE=normal
 export JOURNAL_TIMEOUT_SECONDS MOCK_COVERAGE_MODE
 pass 'coverage failures, empty history, short retention, and timeout handled safely'
 
-assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.7' 'embedded version'
+assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.8' 'embedded version'
+# Confirm both host-changing features are enabled when not set by the caller,
+# but retain explicit safe opt-outs for all integration/regression fixtures.
+defaults=$(env -u AUTO_INSTALL_REQUIREMENTS -u AUTO_ENABLE_PERSISTENT_JOURNAL \
+    bash -c 'source "$1"; printf "%s %s" "$AUTO_INSTALL_REQUIREMENTS" "$AUTO_ENABLE_PERSISTENT_JOURNAL"' \
+    _ "$test_dir/definitions.sh")
+assert_eq "$defaults" '1 1' 'unconfigured host-change defaults are both enabled'
+overrides=$(env AUTO_INSTALL_REQUIREMENTS=0 AUTO_ENABLE_PERSISTENT_JOURNAL=0 \
+    bash -c 'source "$1"; printf "%s %s" "$AUTO_INSTALL_REQUIREMENTS" "$AUTO_ENABLE_PERSISTENT_JOURNAL"' \
+    _ "$test_dir/definitions.sh")
+assert_eq "$overrides" '0 0' 'explicit opt-outs remain effective'
+bash "$SCRIPT" --help | grep -q 'AUTO_INSTALL_REQUIREMENTS=0' || fail 'help omits package-install opt-out'
+bash "$SCRIPT" --help | grep -q 'AUTO_ENABLE_PERSISTENT_JOURNAL=0' || fail 'help omits journald opt-out'
+pass 'automatic-change default-on and explicit opt-out controls'
 bash -n "$SCRIPT"
 pass 'version and Bash syntax'
 
@@ -575,6 +588,7 @@ rm -f "$test_dir/last-email.eml"
 ENV_ARGS=(
     "MOCK_DIR=$test_dir"
     "AUTO_INSTALL_REQUIREMENTS=0"
+    "AUTO_ENABLE_PERSISTENT_JOURNAL=0"
     "KERNEL_LOG_CHECK_ENABLED=0"
     "SMART_CHECK_ENABLED=0"
     "FILESYSTEM_CHECKS_ENABLED=0"
@@ -602,7 +616,7 @@ assert_eq "$rc" 0 'full clean report exit success'
 grep -q 'Subject: .* TEST/OK - ' "$test_dir/last-email.eml" || fail 'clean status subject'
 grep -q '^From: "System Integrity Audit" <system-integrity-audit>' "$test_dir/last-email.eml" || fail 'visible From header'
 grep -q 'Audit coverage' "$test_dir/last-email.eml" || fail 'coverage section missing'
-grep -q 'Script version: *2.0.0-dev.7' "$test_dir/last-email.eml" || fail 'version absent in report'
+grep -q 'Script version: *2.0.0-dev.8' "$test_dir/last-email.eml" || fail 'version absent in report'
 [[ -f $test_dir/integration-state.tsv ]] || fail 'state file not persisted'
 pass 'full clean report, MIME sender, coverage, state persistence'
 
@@ -738,7 +752,7 @@ pass 'placeholder disables early-failure email'
 
 # RPM distributions are no longer blocked at initialization. A separate
 # regression script validates their full package and reporting lifecycle.
-assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.7' 'v2 development version'
+assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.8' 'v2 development version'
 pass 'RPM backend enabled in development release'
 
 # Probe timeout must return 124, and never silently claim the check succeeded.
