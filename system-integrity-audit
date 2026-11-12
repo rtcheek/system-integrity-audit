@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# system-integrity-audit version 2.0.0-dev.2
-# DEVELOPMENT PREVIEW: Debian/Ubuntu backend only; RPM port is not ready.
-# Audit kernel/storage health and package-managed files (via debsums).
+# system-integrity-audit version 2.0.0-dev.3
+# DEVELOPMENT PREVIEW: Debian/Ubuntu and Rocky/RHEL RPM backends.
+# Audit kernel/storage health and native package-managed file integrity.
 
 set -u
 set -o pipefail
@@ -12,15 +12,15 @@ export PATH
 export LC_ALL=C
 
 PROGRAM_NAME='system-integrity-audit'
-PROGRAM_VERSION='2.0.0-dev.2'
+PROGRAM_VERSION='2.0.0-dev.3'
 readonly PROGRAM_NAME PROGRAM_VERSION
 
 # Changelog:
-#   2.0.0-dev.2 (2026-11-12): Add explicit placeholder recipient that
-#                          disables mail without removing email reporting.
-#                          Do not require sendmail or mark notifications as
-#                          delivered when the recipient is a placeholder.
-#   2.0.0-dev.1 (2026-11-12): Start distribution-neutral development branch
+#   2.0.0-dev.3 (2026-11-12): Add RPM verification backend for Rocky/RHEL,
+#                          DNF prerequisite installation, native RPM lock
+#                          handling, safe RPM result classification, and
+#                          backend-specific coverage and reporting.
+#   2.0.0-dev.2 (2026-11-12): Start distribution-neutral development branch
 #                          from the tested 1.7.1 Ubuntu implementation.
 #                          Remove campus-specific mail defaults, disable
 #                          automatic host changes by default, and refuse
@@ -182,6 +182,9 @@ PROBE_TIMEOUT_SECONDS="${PROBE_TIMEOUT_SECONDS:-120}"
 JOURNAL_TIMEOUT_SECONDS="${JOURNAL_TIMEOUT_SECONDS:-180}"
 APT_COMMAND_TIMEOUT_SECONDS="${APT_COMMAND_TIMEOUT_SECONDS:-1800}"
 DEBSUMS_TIMEOUT_SECONDS="${DEBSUMS_TIMEOUT_SECONDS:-7200}"
+RPM_VERIFY_TIMEOUT_SECONDS="${RPM_VERIFY_TIMEOUT_SECONDS:-7200}"
+DNF_COMMAND_TIMEOUT_SECONDS="${DNF_COMMAND_TIMEOUT_SECONDS:-$APT_COMMAND_TIMEOUT_SECONDS}"
+RPM_REPORT_TIMESTAMP_ONLY="${RPM_REPORT_TIMESTAMP_ONLY:-0}"
 ATA_CORRELATION_SECONDS="${ATA_CORRELATION_SECONDS:-120}"
 SMART_ALL_DISKS="${SMART_ALL_DISKS:-0}"
 SMART_EXTENDED_DETAILS="${SMART_EXTENDED_DETAILS:-0}"
@@ -213,7 +216,7 @@ Environment overrides:
   TERMINAL_OUTPUT=auto|always|never Terminal report behavior
   PROGRESS_OUTPUT=auto|always|never Show startup and test progress
   NO_COLOR=1                        Disable ANSI terminal colors
-  AUTO_INSTALL_REQUIREMENTS=1       Explicitly allow installing debsums/smartmontools
+  AUTO_INSTALL_REQUIREMENTS=1       Explicitly allow package installation via apt/dnf
   SMART_CHECK_ENABLED=0             Disable SMART checks
   KERNEL_LOG_CHECK_ENABLED=0        Disable kernel-log scan
   AUTO_ENABLE_PERSISTENT_JOURNAL=1  Explicitly allow persistent journald setup
@@ -230,8 +233,8 @@ Environment overrides:
   LVM_THIN_WARNING_PERCENT=90       LVM thin-pool WARNING threshold
   LVM_THIN_ALERT_PERCENT=95         LVM thin-pool ALERT threshold
   SCRUB_MAX_AGE_DAYS=45             NOTICE when recorded scrub is older
-  APT_LOCK_WAIT_SECONDS=240         Seconds between package-lock retries
-  APT_LOCK_RETRY_COUNT=5            Retries after the first lock check
+  APT_LOCK_WAIT_SECONDS=240         Seconds between package-lock retries (apt/dnf)
+  APT_LOCK_RETRY_COUNT=5            Retries for apt/dnf locks
   MEGARAID_MAX_INDEX=63             Highest physical-drive index to probe if scan fails
   SMART_ALL_DISKS=1                Also examine unmounted physical disks
   SMART_EXTENDED_DETAILS=1         Collect smartctl -x even for healthy disks
@@ -241,14 +244,17 @@ Environment overrides:
   PROBE_TIMEOUT_SECONDS=120        Per-RAID/filesystem command deadline
   JOURNAL_TIMEOUT_SECONDS=180      Journal command deadline
   APT_COMMAND_TIMEOUT_SECONDS=1800 APT invocation deadline
-  DEBSUMS_TIMEOUT_SECONDS=7200     Package verification deadline
+  DNF_COMMAND_TIMEOUT_SECONDS=1800 DNF invocation deadline
+  DEBSUMS_TIMEOUT_SECONDS=7200     debsums verification deadline
+  RPM_VERIFY_TIMEOUT_SECONDS=7200 RPM verification deadline
+  RPM_REPORT_TIMESTAMP_ONLY=1      Include RPM timestamp-only differences
   ATA_CORRELATION_SECONDS=120      ATA companion-event time window
   STATEFUL_NOTIFICATIONS=0         Disable suppression of ongoing notices/warnings
   NOTIFICATION_REPEAT_DAYS=7       Repeat unchanged notices/warnings after 7 days
   NOTIFICATION_STATE_FILE=/var/lib/system-integrity-audit/findings.tsv
                                      Root-only state; ALERT/ERROR always emailed
   EXCEPTIONS_FILE=/usr/local/etc/system-integrity-audit.ignore
-                                     Ignore expected CHANGED paths; shell globs allowed
+                                     Ignore expected modified paths; shell globs allowed
                                      MISSING files are never ignored
 USAGE
         exit 0
@@ -616,7 +622,10 @@ active_package_locks() {
     while read -r lock_path lock_pid lock_command; do
         case "$lock_path" in
             /var/lib/dpkg/lock|/var/lib/dpkg/lock-frontend|\
-            /var/lib/apt/lists/lock|/var/cache/apt/archives/lock)
+            /var/lib/apt/lists/lock|/var/cache/apt/archives/lock|\
+            /var/lib/rpm/.rpm.lock|/usr/lib/sysimage/rpm/.rpm.lock|\
+            /var/cache/dnf/metadata_lock.pid|/var/run/yum.pid|/run/yum.pid|\
+            /run/dnf.pid|/var/lib/rpm/__db.*|/usr/lib/sysimage/rpm/rpmdb.sqlite*)
                 printf '  %s %s %s\n' \
                     "${lock_command:-unknown}" "${lock_pid:-?}" "$lock_path"
                 ;;
@@ -701,12 +710,25 @@ run_apt_get_with_retries() {
     done
 }
 
+run_dnf_install() {
+    local rc
+    # DNF performs its own transaction locking. A bounded invocation prevents
+    # a stuck repository/network request from blocking the whole audit.
+    run_probe "$DNF_COMMAND_TIMEOUT_SECONDS" dnf -y install "$@" \
+        >"$apt_output_file" 2>&1
+    rc=$?
+    if (( rc != 0 )); then
+        printf '%s: DNF installation failed (exit %s):\n' "$PROGRAM_NAME" "$rc" >&2
+        cat "$apt_output_file" >&2
+    fi
+    return "$rc"
+}
+
 install_missing_audit_tools() {
-    local -a packages=()
-    local -a missing_commands=()
+    local -a packages=() missing_commands=()
     local rc
 
-    if ! command -v debsums >/dev/null 2>&1; then
+    if [[ $PACKAGE_BACKEND == dpkg ]] && ! command -v debsums >/dev/null 2>&1; then
         packages+=(debsums)
         missing_commands+=(debsums)
     fi
@@ -726,9 +748,10 @@ install_missing_audit_tools() {
         return 127
     fi
 
-    if ! command -v apt-get >/dev/null 2>&1; then
-        print_missing_commands apt-get "${missing_commands[@]}"
-        return 127
+    if [[ $PACKAGE_BACKEND == rpm ]]; then
+        require_commands dnf || return $?
+    else
+        require_commands apt-get || return $?
     fi
 
     wait_for_package_manager_idle 'automatic prerequisite installation' || return $?
@@ -738,30 +761,29 @@ install_missing_audit_tools() {
     logger -p user.notice -t "$PROGRAM_NAME" \
         "Installing missing audit package(s): ${packages[*]}"
 
-    run_apt_get_with_retries 'package installation' \
-        -q -y install "${packages[@]}"
-    rc=$?
-
-    if (( rc != 0 && rc != 75 )); then
-        printf '%s: initial package installation failed; refreshing APT indexes and retrying.\n' \
-            "$PROGRAM_NAME" >&2
-        run_apt_get_with_retries 'APT index refresh' -q update || return $?
-        run_apt_get_with_retries 'package installation retry' \
-            -q -y install "${packages[@]}" || return $?
-    elif (( rc == 75 )); then
-        return 75
+    if [[ $PACKAGE_BACKEND == rpm ]]; then
+        run_dnf_install "${packages[@]}" || return $?
+    else
+        run_apt_get_with_retries 'package installation' \
+            -q -y install "${packages[@]}"
+        rc=$?
+        if (( rc != 0 && rc != 75 )); then
+            printf '%s: initial package installation failed; refreshing APT indexes and retrying.\n' \
+                "$PROGRAM_NAME" >&2
+            run_apt_get_with_retries 'APT index refresh' -q update || return $?
+            run_apt_get_with_retries 'package installation retry' \
+                -q -y install "${packages[@]}" || return $?
+        elif (( rc == 75 )); then
+            return 75
+        fi
     fi
 
-    if ! command -v debsums >/dev/null 2>&1; then
-        printf '%s: debsums is still unavailable after installation.\n' \
-            "$PROGRAM_NAME" >&2
+    if [[ $PACKAGE_BACKEND == dpkg ]] && ! command -v debsums >/dev/null 2>&1; then
+        printf '%s: debsums is still unavailable after installation.\n' "$PROGRAM_NAME" >&2
         return 127
     fi
-
-    if is_enabled "$SMART_CHECK_ENABLED" && \
-       ! command -v smartctl >/dev/null 2>&1; then
-        printf '%s: smartctl is still unavailable after installation.\n' \
-            "$PROGRAM_NAME" >&2
+    if is_enabled "$SMART_CHECK_ENABLED" && ! command -v smartctl >/dev/null 2>&1; then
+        printf '%s: smartctl is still unavailable after installation.\n' "$PROGRAM_NAME" >&2
         return 127
     fi
 
@@ -769,9 +791,7 @@ install_missing_audit_tools() {
     automatic_notice_count=$((automatic_notice_count + 1))
     printf 'NOTICE\tInstalled missing audit package(s): %s.\n' \
         "$(sanitize_text "${packages[*]}")" >> "$automatic_changes_file"
-
-    logger -p user.notice -t "$PROGRAM_NAME" \
-        'Missing audit prerequisites installed successfully.'
+    logger -p user.notice -t "$PROGRAM_NAME" 'Missing audit prerequisites installed successfully.'
     return 0
 }
 
@@ -828,6 +848,16 @@ lookup_package_owners() {
     local -a owners=()
     local -A seen=()
 
+    if [[ $PACKAGE_BACKEND == rpm ]]; then
+        raw=$(run_probe "$PROBE_TIMEOUT_SECONDS" rpm -qf -- "$file_path" 2>/dev/null) || raw=''
+        if [[ -n $raw ]]; then
+            printf '%s' "$(sanitize_text "$raw")"
+        else
+            printf UNKNOWN
+        fi
+        return 0
+    fi
+
     raw=$(dpkg-query -S -- "$file_path" 2>/dev/null) || raw=''
     marker=": $file_path"
     remaining=$raw
@@ -864,14 +894,36 @@ lookup_package_owners() {
 }
 
 effective_journal_storage_mode() {
-    local line mode='auto'
-
-    while IFS= read -r line || [[ -n $line ]]; do
-        if [[ $line =~ ^[[:space:]]*Storage[[:space:]]*=[[:space:]]*([A-Za-z]+) ]]; then
-            mode=${BASH_REMATCH[1],,}
-        fi
-    done < <(run_probe "$PROBE_TIMEOUT_SECONDS" systemd-analyze cat-config systemd/journald.conf 2>/dev/null)
-
+    local line mode='auto' config_file
+    local -a config_files=()
+    local effective
+    # `cat-config` is not available on all supported systemd versions (notably
+    # RHEL 8). Read regular config and common drop-ins as a conservative fallback.
+    effective=$(run_probe "$PROBE_TIMEOUT_SECONDS" systemd-analyze cat-config \
+        systemd/journald.conf 2>/dev/null) || effective=''
+    if [[ -z $effective ]]; then
+        for config_file in /usr/lib/systemd/journald.conf \
+            /etc/systemd/journald.conf \
+            /usr/lib/systemd/journald.conf.d/*.conf \
+            /run/systemd/journald.conf.d/*.conf \
+            /etc/systemd/journald.conf.d/*.conf; do
+            [[ -r $config_file && -f $config_file ]] || continue
+            config_files+=("$config_file")
+        done
+        for config_file in "${config_files[@]}"; do
+            while IFS= read -r line || [[ -n $line ]]; do
+                if [[ $line =~ ^[[:space:]]*Storage[[:space:]]*=[[:space:]]*([A-Za-z]+) ]]; then
+                    mode=${BASH_REMATCH[1],,}
+                fi
+            done < "$config_file"
+        done
+    else
+        while IFS= read -r line || [[ -n $line ]]; do
+            if [[ $line =~ ^[[:space:]]*Storage[[:space:]]*=[[:space:]]*([A-Za-z]+) ]]; then
+                mode=${BASH_REMATCH[1],,}
+            fi
+        done <<< "$effective"
+    fi
     printf '%s' "$mode"
 }
 
@@ -954,7 +1006,7 @@ ensure_persistent_journal_storage() {
                 return 1
             }
 
-            temp_file="$dropin_dir/.debsums-audit-journald.$$"
+            temp_file="$dropin_dir/.system-integrity-audit-journald.$$"
             if ! printf '%s\n' "$desired_content" > "$temp_file" || \
                ! install -o root -g root -m 0644 -- \
                     "$temp_file" "$JOURNAL_PERSISTENCE_DROPIN"; then
@@ -2457,18 +2509,23 @@ run_debsums_once() {
 
     run_probe "$DEBSUMS_TIMEOUT_SECONDS" debsums -ca >"$changed_file" 2>"$diagnostics_file"
     debsums_status=$?
+    package_verify_status=$debsums_status
 
     run_probe "$DEBSUMS_TIMEOUT_SECONDS" debsums -l >"$coverage_file" 2>>"$diagnostics_file"
     coverage_status=$?
 }
 
-run_debsums_consistently() {
+run_package_verification_consistently() {
     local retry=0
     local lock_details
 
     while :; do
-        wait_for_package_manager_idle 'debsums audit' || return $?
-        run_debsums_once
+        wait_for_package_manager_idle "$PACKAGE_VERIFY_TOOL audit" || return $?
+        if [[ $PACKAGE_BACKEND == rpm ]]; then
+            run_rpm_once
+        else
+            run_debsums_once
+        fi
 
         lock_details=$(active_package_locks)
         if [[ -z $lock_details ]]; then
@@ -2476,23 +2533,133 @@ run_debsums_consistently() {
         fi
 
         if (( retry >= APT_LOCK_RETRY_COUNT )); then
-            printf '%s: package management repeatedly overlapped the debsums scan; giving up.\n' \
+            printf '%s: package management repeatedly overlapped the package scan; giving up.\n' \
                 "$PROGRAM_NAME" >&2
             printf 'Active package-manager locks:\n%s\n' "$lock_details" >&2
             return 75
         fi
 
         retry=$((retry + 1))
-        printf '%s: package management started during debsums; discarding results and waiting %s seconds before retry %s of %s.\n' \
+        printf '%s: package management started during package verification; discarding results and waiting %s seconds before retry %s of %s.\n' \
             "$PROGRAM_NAME" "$APT_LOCK_WAIT_SECONDS" "$retry" \
             "$APT_LOCK_RETRY_COUNT" >&2
         logger -p user.warning -t "$PROGRAM_NAME" \
-            "Package management overlapped debsums; discarding results and retrying ($retry/$APT_LOCK_RETRY_COUNT)."
+            "Package management overlapped package verification; discarding results and retrying ($retry/$APT_LOCK_RETRY_COUNT)."
         sleep "$APT_LOCK_WAIT_SECONDS"
     done
 }
 
+# RPM returns one nine-position attribute mask per mismatching file; it
+# exits 1 for expected verification differences. Never run verify scriptlets.
+run_rpm_once() {
+    : > "$changed_file"
+    : > "$diagnostics_file"
+    : > "$coverage_file"
+    run_probe "$RPM_VERIFY_TIMEOUT_SECONDS" rpm -Va --noscripts --noghost \
+        >"$changed_file" 2>"$diagnostics_file"
+    package_verify_status=$?
+    coverage_status=0
+}
+
+build_rpm_findings() {
+    local line flags marker file_path owners status detail
+    rpm_recognized_count=0
+    rpm_unparsed_count=0
+    rpm_timestamp_ignored_count=0
+    rpm_ghost_skipped_count=0
+    rpm_unverifiable_count=0
+
+    : > "$findings_file"
+    : > "$ignored_findings_file"
+    : > "$diagnostics_safe_file"
+    : > "$coverage_safe_file"
+
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ -n $line ]] || continue
+        status=''
+        flags=''
+        marker=''
+        file_path=''
+        if [[ $line =~ ^missing[[:space:]]+([[:alpha:]])?[[:space:]]+(/.*)$ ]]; then
+            marker=${BASH_REMATCH[1]}
+            file_path=${BASH_REMATCH[2]}
+            flags='missing'
+            status=MISSING
+        elif [[ $line =~ ^(.{9})[[:space:]]+([[:alpha:]])?[[:space:]]+(/.*)$ ]]; then
+            flags=${BASH_REMATCH[1]}
+            marker=${BASH_REMATCH[2]}
+            file_path=${BASH_REMATCH[3]}
+            if [[ ! $flags =~ ^[SM5DLUGTP.?]{9}$ ]]; then
+                rpm_unparsed_count=$((rpm_unparsed_count + 1))
+                printf 'Unrecognized RPM verification flags: %s\n' "$(sanitize_text "$line")" \
+                    >> "$diagnostics_safe_file"
+                continue
+            fi
+            if [[ $flags == *'?'* ]]; then
+                status=UNKNOWN
+                rpm_unverifiable_count=$((rpm_unverifiable_count + 1))
+            elif [[ $flags == '.........' ]]; then
+                rpm_recognized_count=$((rpm_recognized_count + 1))
+                continue
+            elif [[ $marker == c ]]; then
+                status=CONFIG
+            elif [[ $flags == *[S5L]* ]]; then
+                status=CHANGED
+            elif [[ $flags == '.......T.' ]]; then
+                # File mtimes are routinely changed by legitimate operations.
+                if is_enabled "$RPM_REPORT_TIMESTAMP_ONLY"; then
+                    status=TIMESTAMP
+                else
+                    rpm_timestamp_ignored_count=$((rpm_timestamp_ignored_count + 1))
+                    rpm_recognized_count=$((rpm_recognized_count + 1))
+                    continue
+                fi
+            else
+                status=METADATA
+            fi
+        else
+            rpm_unparsed_count=$((rpm_unparsed_count + 1))
+            printf 'Unrecognized RPM verification record: %s\n' \
+                "$(sanitize_text "$line")" >> "$diagnostics_safe_file"
+            continue
+        fi
+        rpm_recognized_count=$((rpm_recognized_count + 1))
+        # %ghost objects are created at runtime, not supplied as package
+        # payload, so their absence is not evidence of package corruption.
+        if [[ $marker == g ]]; then
+            rpm_ghost_skipped_count=$((rpm_ghost_skipped_count + 1))
+            continue
+        fi
+        owners=$(lookup_package_owners "$file_path")
+        detail="$owners [$flags${marker:+ $marker}]"
+        if [[ $status != MISSING ]] && changed_path_is_excepted "$file_path"; then
+            printf 'IGNORED\t%s\t%s\n' "$(sanitize_text "$detail")" \
+                "$(sanitize_text "$file_path")" >> "$ignored_findings_file"
+        else
+            printf '%s\t%s\t%s\n' "$status" "$(sanitize_text "$detail")" \
+                "$(sanitize_text "$file_path")" >> "$findings_file"
+        fi
+    done < "$changed_file"
+
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ -n $line ]] || continue
+        printf '%s\n' "$(sanitize_text "$line")" >> "$diagnostics_safe_file"
+    done < "$diagnostics_file"
+    sort -u "$findings_file" -o "$findings_file"
+    sort -u "$ignored_findings_file" -o "$ignored_findings_file"
+    changed_count=$(grep -c '^CHANGED' "$findings_file" || true)
+    missing_count=$(grep -c '^MISSING' "$findings_file" || true)
+    ignored_changed_count=$(grep -c '^IGNORED' "$ignored_findings_file" || true)
+    package_warning_count=$(grep -Ec '^(CONFIG|METADATA|UNKNOWN)' "$findings_file" || true)
+    package_notice_count=$(grep -c '^TIMESTAMP' "$findings_file" || true)
+    coverage_count=0  # RPM verifies attributes present in its installed-package database.
+}
+
 build_package_findings() {
+    if [[ $PACKAGE_BACKEND == rpm ]]; then
+        build_rpm_findings
+        return $?
+    fi
     local file_path package_owners line package_name
     local include_diagnostic
 
@@ -2599,7 +2766,9 @@ assemble_finding_ledger() {
     done < "$smart_summary_file"
     while IFS=$'\t' read -r status resource detail; do
         case "$status" in
-            MISSING|CHANGED) record_finding ALERT 'DEBSUMS' "$detail" "$status $resource" ;;
+            MISSING|CHANGED) record_finding ALERT 'PACKAGE' "$detail" "$status $resource" ;;
+            CONFIG|METADATA|UNKNOWN) record_finding WARNING 'PACKAGE' "$detail" "$status $resource" ;;
+            TIMESTAMP) record_finding NOTICE 'PACKAGE' "$detail" "$status $resource" ;;
         esac
     done < "$findings_file"
 
@@ -2614,7 +2783,7 @@ assemble_finding_ledger() {
         record_finding WARNING 'JOURNAL-CONFIG' 'persistent storage' 'Persistence enabled during this audit.'
     fi
     if (( coverage_alert > 0 )); then
-        record_finding WARNING 'PACKAGE-COVERAGE' 'debsums' \
+        record_finding WARNING 'PACKAGE-COVERAGE' "$PACKAGE_VERIFY_TOOL" \
             "$coverage_count installed package(s) have no checksum manifests."
     fi
     while IFS=$'\t' read -r severity detail; do
@@ -2629,7 +2798,7 @@ assemble_finding_ledger() {
 # identity so newly observed failures cannot be hidden by previous ones.
 finding_id() {
     local severity=$1 category=$2 resource=$3 detail=$4 key
-    if [[ $category == KERNEL || $category == DEBSUMS || \
+    if [[ $category == KERNEL || $category == PACKAGE || \
           $category == AUTOMATIC-CHANGE ]]; then
         key="$severity|$category|$resource|$detail"
     else
@@ -2792,15 +2961,15 @@ print_terminal_report() {
         line_color=''
 
         case "$line" in
-            'Ubuntu storage and package integrity audit'|'Audit coverage'|'Summary'|\
+            'System integrity and storage health audit'|'Audit coverage'|'Summary'|\
             'Recent kernel storage alerts'|'Recent kernel storage warnings'|\
             'Recent kernel storage scan error'|\
             'Filesystem, RAID, and capacity findings'|\
             'Filesystem and RAID details'|'SMART device summary'|\
             'SMART details'|'Package files that failed verification'|\
-            'Expected changed package files ignored'|\
+            'Expected package verification differences ignored'|\
             'Packages not checked because checksum data is absent'|\
-            'Raw debsums diagnostics'|'Automatic system changes'|\
+            'Raw package verification diagnostics'|'Automatic system changes'|\
             'Audit execution notes'|'Resolved since previous audit')
                 line_color="${color_bold}${color_cyan}"
                 ;;
@@ -2917,7 +3086,7 @@ build_html_report() {
         printf '%s\n' '<body style="margin:0;padding:0;background:#f3f4f6;color:#111827;font-family:Consolas,Monaco,Courier New,monospace;">'
         printf '%s\n' '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0"><tr><td align="center" style="padding:24px 12px;">'
         printf '%s\n' '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="max-width:1100px;background:#fff;border:1px solid #d1d5db;border-radius:10px;">'
-        printf '<tr><td style="padding:22px;background:#0f172a;color:#fff;font-size:21px;font-weight:700;">Ubuntu storage and package integrity audit</td></tr>\n'
+        printf '<tr><td style="padding:22px;background:#0f172a;color:#fff;font-size:21px;font-weight:700;">System integrity and storage health audit</td></tr>\n'
         printf '<tr><td style="padding:16px 22px;background:%s;border-left:6px solid %s;color:%s;font-size:17px;font-weight:700;">Audit status: %s</td></tr>\n' \
             "$state_background" "$state_border" "$state_text" "$(html_escape "$state")"
         printf '%s\n' '<tr><td style="padding:22px;">'
@@ -2933,15 +3102,15 @@ build_html_report() {
                 style='color:#4b5563;'
             else
                 case "$line" in
-                    'Ubuntu storage and package integrity audit'|'Audit coverage'|'Summary'|\
+                    'System integrity and storage health audit'|'Audit coverage'|'Summary'|\
                     'Recent kernel storage alerts'|'Recent kernel storage warnings'|\
                     'Recent kernel storage scan error'|\
                     'Filesystem, RAID, and capacity findings'|\
                     'Filesystem and RAID details'|'SMART device summary'|\
                     'SMART details'|'Package files that failed verification'|\
-                    'Expected changed package files ignored'|\
+                    'Expected package verification differences ignored'|\
                     'Packages not checked because checksum data is absent'|\
-                    'Raw debsums diagnostics'|'Automatic system changes'|\
+                    'Raw package verification diagnostics'|'Automatic system changes'|\
                     'Audit execution notes'|'Resolved since previous audit')
                         style='color:#0369a1;font-weight:700;'
                         ;;
@@ -2979,8 +3148,8 @@ if (( EUID != 0 )); then
     exit 1
 fi
 
-# The RPM backend is not yet implemented. Fail clearly before any audit or
-# package management is attempted on unsupported distributions.
+# Choose the native package verification backend before checking dependencies.
+# Unknown RPM-like distributions are intentionally not assumed compatible.
 if [[ ! -r $OS_RELEASE_FILE ]]; then
     printf '%s: cannot identify OS from %s.\n' "$PROGRAM_NAME" "$OS_RELEASE_FILE" >&2
     exit 78
@@ -2988,16 +3157,20 @@ fi
 # shellcheck disable=SC1090
 . "$OS_RELEASE_FILE"
 case "${ID:-}" in
-    ubuntu|debian) ;;
+    ubuntu|debian)
+        PACKAGE_BACKEND=dpkg
+        PACKAGE_VERIFY_TOOL=debsums
+        ;;
     rocky|rhel|almalinux|centos)
-        printf '%s: RPM package-integrity backend is not implemented in this development preview.\n' "$PROGRAM_NAME" >&2
-        exit 78
+        PACKAGE_BACKEND=rpm
+        PACKAGE_VERIFY_TOOL=rpm
         ;;
     *)
         printf '%s: unsupported distribution ID: %s.\n' "$PROGRAM_NAME" "${ID:-unknown}" >&2
         exit 78
         ;;
 esac
+readonly PACKAGE_BACKEND PACKAGE_VERIFY_TOOL
 
 if ! is_nonnegative_integer "$APT_LOCK_WAIT_SECONDS" || \
    ! is_nonnegative_integer "$APT_LOCK_RETRY_COUNT" || \
@@ -3032,7 +3205,8 @@ fi
 
 for timeout_value in "$SMART_TIMEOUT_SECONDS" "$PROBE_TIMEOUT_SECONDS" \
     "$JOURNAL_TIMEOUT_SECONDS" "$APT_COMMAND_TIMEOUT_SECONDS" \
-    "$DEBSUMS_TIMEOUT_SECONDS" "$ATA_CORRELATION_SECONDS" \
+    "$DEBSUMS_TIMEOUT_SECONDS" "$RPM_VERIFY_TIMEOUT_SECONDS" \
+    "$DNF_COMMAND_TIMEOUT_SECONDS" "$ATA_CORRELATION_SECONDS" \
     "$NOTIFICATION_REPEAT_DAYS" "$MEGARAID_SCAN_BUDGET_SECONDS"; do
     if ! is_nonnegative_integer "$timeout_value" || (( timeout_value < 1 )); then
         printf '%s: timeouts, ATA correlation and notification repeat days must be positive integers.\n' "$PROGRAM_NAME" >&2
@@ -3047,9 +3221,14 @@ if (( MEGARAID_MAX_INDEX > 255 )); then
 fi
 
 core_commands=(
-    cat date dirname dpkg-query flock grep head hostname logger lslocks mkdir mktemp
+    cat date dirname flock grep head hostname logger lslocks mkdir mktemp
     paste rm sed sleep sort uname wc timeout sha256sum mv chmod cp
 )
+if [[ $PACKAGE_BACKEND == rpm ]]; then
+    core_commands+=(rpm)
+else
+    core_commands+=(dpkg-query)
+fi
 # Email delivery is opt-in. Do not require an MTA for terminal-only use.
 if email_reporting_enabled; then
     core_commands+=(sendmail)
@@ -3156,7 +3335,7 @@ fi
 
 failure_context='verifying audit commands'
 progress_start 'Verifying audit commands'
-require_commands debsums
+require_commands "$PACKAGE_VERIFY_TOOL"
 command_status=$?
 if (( command_status == 0 )) && is_enabled "$SMART_CHECK_ENABLED"; then
     require_commands smartctl
@@ -3184,6 +3363,15 @@ smart_fail_count=0
 smart_error_count=0
 smart_unsupported_count=0
 debsums_status=0
+package_verify_status=0
+package_run_status=0
+package_warning_count=0
+package_notice_count=0
+rpm_recognized_count=0
+rpm_unparsed_count=0
+rpm_timestamp_ignored_count=0
+rpm_ghost_skipped_count=0
+rpm_unverifiable_count=0
 coverage_status=0
 changed_count=0
 missing_count=0
@@ -3293,74 +3481,112 @@ else
 fi
 
 failure_context='verifying package-managed files'
-progress_start 'Verifying package-managed files with debsums'
-run_debsums_consistently
-debsums_run_status=$?
-if (( debsums_run_status != 0 )); then
+progress_start "Verifying package-managed files with $PACKAGE_VERIFY_TOOL"
+run_package_verification_consistently
+package_run_status=$?
+if (( package_run_status != 0 )); then
     progress_finish failed
     execution_error=1
-    final_exit_status=$debsums_run_status
+    final_exit_status=$package_run_status
     : > "$changed_file"
     : > "$diagnostics_file"
     : > "$coverage_file"
-    printf 'debsums was not run because package management did not become idle.\n' \
-        >> "$execution_notes_file"
-elif (( debsums_status == 2 || debsums_status == 3 || coverage_status != 0 )); then
+    printf '%s was not run because package management did not become idle.\n' \
+        "$PACKAGE_VERIFY_TOOL" >> "$execution_notes_file"
+elif [[ $PACKAGE_BACKEND == dpkg ]] && \
+     (( debsums_status == 2 || debsums_status == 3 || coverage_status != 0 )); then
+    progress_finish warning
+elif [[ $PACKAGE_BACKEND == rpm ]] && (( package_verify_status != 0 )); then
     progress_finish warning
 else
     progress_finish done
 fi
 
-progress_start 'Classifying package verification results' 
+progress_start 'Classifying package verification results'
 build_package_findings
 if (( changed_count + missing_count > 0 )); then
     progress_finish failed
-elif (( ignored_changed_count > 0 || coverage_count > 0 )); then
+elif (( package_warning_count > 0 )); then
+    progress_finish warning
+elif (( ignored_changed_count + coverage_count + package_notice_count > 0 )); then
     progress_finish notice
 else
     progress_finish done
 fi
 
-case "$debsums_status" in
-    0)
-        if (( changed_count + missing_count > 0 )); then
+if [[ $PACKAGE_BACKEND == rpm ]]; then
+    if (( package_run_status == 0 )); then
+        case "$package_verify_status" in
+            0)
+                if (( rpm_recognized_count > 0 || rpm_unparsed_count > 0 )); then
+                    execution_error=1
+                    (( final_exit_status == 0 )) && final_exit_status=1
+                    printf 'RPM reported successful verification but produced mismatch records.\n' \
+                        >> "$execution_notes_file"
+                fi
+                ;;
+            1)
+                if (( rpm_recognized_count + rpm_unparsed_count == 0 )); then
+                    execution_error=1
+                    (( final_exit_status == 0 )) && final_exit_status=1
+                    printf 'RPM returned a mismatch status with no file records; verification may be incomplete.\n' \
+                        >> "$execution_notes_file"
+                fi
+                ;;
+            *)
+                execution_error=1
+                (( final_exit_status == 0 )) && final_exit_status=1
+                printf 'RPM returned exit %s; verification may be incomplete.\n' \
+                    "$package_verify_status" >> "$execution_notes_file"
+                ;;
+        esac
+        if (( rpm_unparsed_count > 0 || rpm_unverifiable_count > 0 )); then
             execution_error=1
             (( final_exit_status == 0 )) && final_exit_status=1
-            printf 'debsums returned success but parsed verification findings were present.\n' \
-                >> "$execution_notes_file"
+            printf 'RPM had %s unrecognized and %s unreadable verification record(s); coverage is incomplete.\n' \
+                "$rpm_unparsed_count" "$rpm_unverifiable_count" >> "$execution_notes_file"
         fi
-        ;;
-    2)
-        if (( changed_count + missing_count > 0 )); then
-            mismatch_found=1
-        elif (( ignored_changed_count == 0 )); then
-            execution_error=1
-            (( final_exit_status == 0 )) && final_exit_status=1
-            printf 'debsums reported mismatches, but no recognized findings were parsed.\n' \
-                >> "$execution_notes_file"
-        fi
-        ;;
-    3)
         (( changed_count + missing_count > 0 )) && mismatch_found=1
+    fi
+else
+    case "$debsums_status" in
+        0)
+            if (( changed_count + missing_count > 0 )); then
+                execution_error=1
+                (( final_exit_status == 0 )) && final_exit_status=1
+                printf 'debsums returned success but parsed verification findings were present.\n' \
+                    >> "$execution_notes_file"
+            fi
+            ;;
+        2)
+            if (( changed_count + missing_count > 0 )); then
+                mismatch_found=1
+            elif (( ignored_changed_count == 0 )); then
+                execution_error=1
+                (( final_exit_status == 0 )) && final_exit_status=1
+                printf 'debsums reported mismatches, but no recognized findings were parsed.\n' \
+                    >> "$execution_notes_file"
+            fi
+            ;;
+        3)
+            (( changed_count + missing_count > 0 )) && mismatch_found=1
+            execution_error=1
+            (( final_exit_status == 0 )) && final_exit_status=1
+            ;;
+        *)
+            if (( package_run_status == 0 )); then
+                execution_error=1
+                (( final_exit_status == 0 )) && final_exit_status=1
+                printf 'debsums exited with an unexpected status (%s); verification may be incomplete.\n' \
+                    "$debsums_status" >> "$execution_notes_file"
+            fi
+            (( changed_count + missing_count > 0 )) && mismatch_found=1
+            ;;
+    esac
+    if (( coverage_status != 0 && package_run_status == 0 )); then
         execution_error=1
         (( final_exit_status == 0 )) && final_exit_status=1
-        ;;
-    *)
-        if (( debsums_run_status == 0 )); then
-            execution_error=1
-            (( final_exit_status == 0 )) && final_exit_status=1
-            printf 'debsums exited with an unexpected status (%s); verification may be incomplete.\n' \
-                "$debsums_status" >> "$execution_notes_file"
-        fi
-        # Regardless of why debsums exited unusually, real parsed findings
-        # must still classify as ALERT rather than being masked by ERROR.
-        (( changed_count + missing_count > 0 )) && mismatch_found=1
-        ;;
-esac
-
-if (( coverage_status != 0 && debsums_run_status == 0 )); then
-    execution_error=1
-    (( final_exit_status == 0 )) && final_exit_status=1
+    fi
 fi
 
 if is_enabled "$REPORT_COVERAGE_GAPS" && (( coverage_count > 0 )); then
@@ -3390,12 +3616,7 @@ progress_start 'Building audit report'
 
 system_name=$(hostname -f 2>/dev/null || hostname)
 short_name=$(hostname -s 2>/dev/null || hostname)
-os_name='Unknown Ubuntu/Debian release'
-if [[ -r /etc/os-release ]]; then
-    # shellcheck disable=SC1091
-    . /etc/os-release
-    os_name=${PRETTY_NAME:-${NAME:-$os_name}}
-fi
+os_name=${PRETTY_NAME:-${NAME:-Unknown Linux release}}
 machine_id='Unavailable'
 if [[ -r /etc/machine-id ]]; then
     machine_id=$(cat /etc/machine-id)
@@ -3419,7 +3640,7 @@ change_severity=''
 change_message=''
 
 {
-    printf 'Debian/Ubuntu storage and package integrity audit (2.0 development preview)\n'
+    printf 'System integrity and storage health audit (2.0 development preview)\n'
     printf '==========================================\n\n'
     printf 'Script version:                 %s\n' "$PROGRAM_VERSION"
     printf 'System name:                    %s\n' "$(sanitize_text "$system_name")"
@@ -3431,7 +3652,8 @@ change_message=''
     printf 'Kernel log lookback:            %s\n' "$(sanitize_text "$KERNEL_LOG_SINCE")"
     printf 'Exceptions file:                %s\n' "$(sanitize_text "$EXCEPTIONS_FILE")"
     printf 'Exception patterns loaded:      %s\n' "$exception_pattern_count"
-    printf 'debsums exit code:              %s\n' "$debsums_status"
+    printf 'Package backend:                 %s\n' "$PACKAGE_BACKEND"
+    printf 'Package verifier exit code:      %s\n' "$package_verify_status"
     printf '\n'
 
     printf 'Audit coverage\n'
@@ -3469,10 +3691,12 @@ change_message=''
     else
         printf 'SMART physical disk review:     DISABLED\n'
     fi
-    if (( debsums_run_status > 0 || coverage_status > 0 )); then
+    if (( package_run_status > 0 || coverage_status > 0 )) || \
+       { [[ $PACKAGE_BACKEND == rpm ]] && (( rpm_unparsed_count + rpm_unverifiable_count > 0 )); }; then
         printf 'Package-file verification:      INCOMPLETE\n'
     else
-        printf 'Package-file verification:      COMPLETED (checksum-covered files only)\n'
+        printf 'Package-file verification:      COMPLETED (native %s database)\n' \
+            "$PACKAGE_BACKEND"
     fi
     printf '\n'
 
@@ -3506,6 +3730,11 @@ change_message=''
     printf 'SMART command errors:           %s\n' "$smart_error_count"
     printf 'SMART unsupported devices:      %s\n' "$smart_unsupported_count"
     printf 'Changed package files:          %s\n' "$changed_count"
+    printf 'Package config/metadata warnings: %s\n' "$package_warning_count"
+    if [[ $PACKAGE_BACKEND == rpm ]]; then
+        printf 'RPM timestamp-only skipped:     %s\n' "$rpm_timestamp_ignored_count"
+        printf 'RPM unparsed records:           %s\n' "$rpm_unparsed_count"
+    fi
     printf 'Missing package files:          %s\n' "$missing_count"
     printf 'Expected changed files ignored: %s\n' "$ignored_changed_count"
     printf 'Packages without checksum data: %s\n' "$coverage_count"
@@ -3594,7 +3823,7 @@ change_message=''
     fi
 
     if [[ -s $ignored_findings_file ]]; then
-        printf 'Expected changed package files ignored\n'
+        printf 'Expected package verification differences ignored\n'
         printf -- '--------------------------------------\n'
         printf '%-9s %-40s %s\n' 'STATUS' 'PACKAGE(S)' 'FILE'
         printf '%-9s %-40s %s\n' '---------' '----------------------------------------' '----'
@@ -3614,7 +3843,7 @@ change_message=''
     fi
 
     if [[ -s $diagnostics_safe_file ]]; then
-        printf 'Raw debsums diagnostics\n'
+        printf 'Raw package verification diagnostics\n'
         printf -- '------------------------\n'
         cat "$diagnostics_safe_file"
         printf '\n'
@@ -3661,12 +3890,19 @@ change_message=''
     printf 'filesystem-native health data, and recorded scrub status. It does not run\n'
     printf 'fsck, repair filesystems, or start deep scrubs. No online health check can\n'
     printf 'guarantee every disk, cable, controller, RAID, virtual-storage, or\n'
-    printf 'filesystem condition. debsums checks package-managed\n'
-    printf 'file contents that have checksum data; expected CHANGED paths may be\n'
-    printf 'suppressed by the exceptions file, but MISSING files are never suppressed.\n'
-    printf 'debsums does not verify arbitrary local data, permissions, ownership, ACLs,\n'
-    printf 'or all filesystem metadata. Filenames containing embedded newlines remain\n'
-    printf 'limited by debsums line-oriented output.\n'
+    printf 'filesystem condition. %s checks package-managed\n' "$PACKAGE_VERIFY_TOOL"
+    if [[ $PACKAGE_BACKEND == dpkg ]]; then
+        printf 'file checksums where manifests are available. Modified paths may be\n'
+    else
+        printf 'file attributes stored in the RPM database. Config and metadata\n'
+        printf 'differences produce warnings; timestamp-only changes are skipped unless\n'
+        printf 'RPM_REPORT_TIMESTAMP_ONLY=1 is configured. Modified paths may be\n'
+    fi
+    printf 'suppressed by exceptions, but MISSING files are never suppressed.\n'
+    printf '%s does not verify arbitrary local data, and cannot establish that\n' "$PACKAGE_VERIFY_TOOL"
+    printf 'the local package database is trustworthy. Embedded-newline filenames\n'
+    printf 'remain limited by line-oriented verification output. RPM metadata and\n'
+    printf 'config differences are reported separately from changed package payloads.\n'
 } > "$report_file"
 
 build_html_report "$subject" "$subject_state"
