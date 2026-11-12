@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# system-integrity-audit version 2.0.0-dev.6
+# system-integrity-audit version 2.0.0-dev.7
 # DEVELOPMENT PREVIEW: Debian/Ubuntu and Rocky/RHEL RPM backends.
 # Audit kernel/storage health and native package-managed file integrity.
 
@@ -12,10 +12,15 @@ export PATH
 export LC_ALL=C
 
 PROGRAM_NAME='system-integrity-audit'
-PROGRAM_VERSION='2.0.0-dev.6'
+PROGRAM_VERSION='2.0.0-dev.7'
 readonly PROGRAM_NAME PROGRAM_VERSION
 
 # Changelog:
+#   2.0.0-dev.7 (2026-11-12): Schedule conservative, non-captive SMART
+#                          short tests after 60 days with strict CPU/iowait
+#                          gates; show subsequent logged results and skips.
+#                          Preserve SMART detail tabs, stabilize package
+#                          notification IDs, clarify prerequisite checks.
 #   2.0.0-dev.6 (2026-11-12): Distinguish verified missing /run
 #                          directories from missing payload files, add
 #                          exact-path approved-missing exceptions, and
@@ -199,6 +204,12 @@ RPM_REPORT_TIMESTAMP_ONLY="${RPM_REPORT_TIMESTAMP_ONLY:-0}"
 ATA_CORRELATION_SECONDS="${ATA_CORRELATION_SECONDS:-120}"
 SMART_ALL_DISKS="${SMART_ALL_DISKS:-0}"
 SMART_EXTENDED_DETAILS="${SMART_EXTENDED_DETAILS:-0}"
+# Short tests are opt-out, but never start unless device/history, state,
+# and idle CPU/I/O gates can all be verified. One new test per audit.
+SMART_SHORT_TEST_AUTO="${SMART_SHORT_TEST_AUTO:-1}"
+SMART_SHORT_TEST_AGE_DAYS="${SMART_SHORT_TEST_AGE_DAYS:-60}"
+SMART_SHORT_TEST_STATE_FILE="${SMART_SHORT_TEST_STATE_FILE:-/var/lib/system-integrity-audit/smart-short-tests.tsv}"
+SMART_CPU_STAT_PATH="${SMART_CPU_STAT_PATH:-/proc/stat}"
 MEGARAID_COMPLETE_SCAN="${MEGARAID_COMPLETE_SCAN:-1}"
 MEGARAID_SCAN_BUDGET_SECONDS="${MEGARAID_SCAN_BUDGET_SECONDS:-240}"
 STATEFUL_NOTIFICATIONS="${STATEFUL_NOTIFICATIONS:-1}"
@@ -253,6 +264,12 @@ Environment overrides:
   MEGARAID_MAX_INDEX=63             Highest physical-drive index to probe if scan fails
   SMART_ALL_DISKS=1                Also examine unmounted physical disks
   SMART_EXTENDED_DETAILS=1         Collect smartctl -x even for healthy disks
+  SMART_SHORT_TEST_AUTO=0          Opt out of safe automatic SMART short tests
+  SMART_SHORT_TEST_AGE_DAYS=60     Minimum test age (calendar state/power-on-hour history)
+  SMART_SHORT_TEST_STATE_FILE=path Root-only record of audit-initiated tests
+  SMART_CPU_STAT_PATH=/proc/stat  Kernel CPU counters (override for testing)
+                                     Starts at most one non-captive ATA test per audit
+                                     only if CPU idle >98% and iowait <2%
   MEGARAID_COMPLETE_SCAN=0         Trust --scan-open; skip complementary probes
   MEGARAID_SCAN_BUDGET_SECONDS=240 Limit complementary scan duration
   SMART_TIMEOUT_SECONDS=90         Per-smartctl command deadline
@@ -300,6 +317,20 @@ trim_whitespace() {
     value="${value%"${value##*[![:space:]]}"}"
     printf '%s' "$value"
 }
+
+# SMART's human-facing diagnostics use literal tabs for alignment. Keep
+# these tabs (but not escape/control sequences) in terminal and HTML reports.
+sanitize_smart_detail_line() {
+    local value=${1-}
+    value=${value//\\/\\\\}
+    value=${value//$'\033'/\\x1b}
+    value=${value//$'\r'/\\r}
+    value=${value//$'\n'/\\n}
+    value=${value//$'\a'/\\x07}
+    value=${value//$'\b'/\\x08}
+    printf '%s' "$value"
+}
+
 
 sanitize_text() {
     local value=${1-}
@@ -1541,6 +1572,223 @@ discover_megaraid_targets() {
     done
 }
 
+# Return total, idle, and iowait CPU jiffies from the first aggregate line.
+# The first eight counters are disjoint; guest counters are already in user/nice.
+smart_cpu_snapshot() {
+    local label user nice system idle iowait irq softirq steal unused v
+    local -a fields=()
+    [[ -r $SMART_CPU_STAT_PATH ]] || return 1
+    read -r label user nice system idle iowait irq softirq steal unused < "$SMART_CPU_STAT_PATH" || return 1
+    [[ $label == cpu ]] || return 1
+    for v in "$user" "$nice" "$system" "$idle" "$iowait" "$irq" "$softirq" "$steal"; do
+        [[ $v =~ ^[0-9]+$ ]] || return 1
+        fields+=("$((10#$v))")
+    done
+    printf '%s %s %s\n' \
+        "$((fields[0]+fields[1]+fields[2]+fields[3]+fields[4]+fields[5]+fields[6]+fields[7]))" \
+        "${fields[3]}" "${fields[4]}"
+}
+
+smart_cpu_quiet_enough() {
+    local before after total_a idle_a wait_a total_b idle_b wait_b dt di dw
+    smart_cpu_idle_bp=-1
+    smart_cpu_iowait_bp=-1
+    before=$(smart_cpu_snapshot) || return 1
+    # Sample utilization; a single /proc/stat snapshot cannot measure load.
+    sleep 1 || return 1
+    after=$(smart_cpu_snapshot) || return 1
+    read -r total_a idle_a wait_a <<< "$before"
+    read -r total_b idle_b wait_b <<< "$after"
+    dt=$((total_b-total_a)); di=$((idle_b-idle_a)); dw=$((wait_b-wait_a))
+    (( dt > 0 && di >= 0 && dw >= 0 && di <= dt && dw <= dt )) || return 1
+    smart_cpu_idle_bp=$((di*10000/dt))
+    smart_cpu_iowait_bp=$((dw*10000/dt))
+    (( smart_cpu_idle_bp > 9800 && smart_cpu_iowait_bp < 200 ))
+}
+
+smart_short_test_note() {
+    local result=$1 device=$2 explanation=$3
+    printf '%s\t%s\t%s\n' "$(sanitize_text "$result")" \
+        "$(sanitize_text "$device")" "$(sanitize_text "$explanation")" \
+        >> "$smart_short_test_notes_file"
+    case "$result" in
+        STARTED) smart_short_test_started_count=$((smart_short_test_started_count+1)) ;;
+        SKIPPED|DISABLED|FAILED) smart_short_test_skipped_count=$((smart_short_test_skipped_count+1)) ;;
+    esac
+}
+
+# Persist intent BEFORE dispatching the firmware test. If the process dies
+# immediately after dispatch, the next audit still knows a start was attempted.
+# The singleton audit lock guards the read/modify/write cycle.
+smart_short_test_record_start() {
+    local device_key=$1 epoch=$2 dir temp key when extra
+    dir=${SMART_SHORT_TEST_STATE_FILE%/*}
+    [[ $SMART_SHORT_TEST_STATE_FILE == /* && $dir != "$SMART_SHORT_TEST_STATE_FILE" && \
+       ! -L $SMART_SHORT_TEST_STATE_FILE && ! -L $dir ]] || return 1
+    if [[ -e $SMART_SHORT_TEST_STATE_FILE && ! -f $SMART_SHORT_TEST_STATE_FILE ]]; then
+        return 1
+    fi
+    mkdir -p -- "$dir" || return 1
+    chmod 0700 -- "$dir" || return 1
+    temp=$(mktemp "$dir/.smart-short-tests.XXXXXXXX") || return 1
+    chmod 0600 -- "$temp" || { rm -f -- "$temp"; return 1; }
+    if [[ -f $SMART_SHORT_TEST_STATE_FILE ]]; then
+        while IFS=$'\t' read -r key when extra; do
+            [[ $key == "$device_key" ]] && continue
+            if [[ $key =~ ^[0-9a-f]{64}$ && $when =~ ^[0-9]+$ ]]; then
+                printf '%s\t%s\n' "$key" "$when" >> "$temp"
+            fi
+        done < "$SMART_SHORT_TEST_STATE_FILE" || { rm -f -- "$temp"; return 1; }
+    fi
+    printf '%s\t%s\n' "$device_key" "$epoch" >> "$temp"
+    if ! mv -f -- "$temp" "$SMART_SHORT_TEST_STATE_FILE"; then
+        rm -f -- "$temp"
+        return 1
+    fi
+}
+
+smart_short_test_previous_start() {
+    local device_key=$1 key when extra
+    [[ ! -L $SMART_SHORT_TEST_STATE_FILE ]] || return 1
+    if [[ ! -e $SMART_SHORT_TEST_STATE_FILE ]]; then
+        printf '0\n'
+        return 0
+    fi
+    [[ -f $SMART_SHORT_TEST_STATE_FILE && -r $SMART_SHORT_TEST_STATE_FILE ]] || return 1
+    while IFS=$'\t' read -r key when extra; do
+        if [[ $key == "$device_key" && $when =~ ^[0-9]+$ ]]; then
+            printf '%s\n' "$when"
+            return 0
+        fi
+    done < "$SMART_SHORT_TEST_STATE_FILE"
+    printf '0\n'
+}
+
+# This first version only auto-starts directly addressable ATA disks. SCSI,
+# NVMe, USB bridges without confirmed ATA capabilities, and RAID passthrough
+# are audited normally but skipped for automated test initiation.
+maybe_start_smart_short_test() {
+    local device=$1 device_type=$2 display=$3 health_output=$4 health_status=$5
+    local history_file latest_line age_note='' now last_epoch serial device_key
+    local rc status_value hours_current hours_logged delta age_hours oldest_result
+    local attr attr_name flag v w thresh type updated when_failed raw extra
+    local previous_note=''
+    if ! is_enabled "$SMART_SHORT_TEST_AUTO"; then
+        smart_short_test_note DISABLED "$display" 'automatic short tests disabled'
+        return 0
+    fi
+    if [[ $health_status != OK ]]; then
+        smart_short_test_note SKIPPED "$display" 'health/SMART coverage not OK'
+        return 0
+    fi
+    if [[ -n $device_type || $device == /dev/nvme* ]] || \
+       ! grep -q '^ATA Version is:' "$health_output"; then
+        smart_short_test_note SKIPPED "$display" 'automatic testing limited to directly attached ATA devices'
+        return 0
+    fi
+
+    history_file="$work_dir/smart-selftest-$(printf '%s' "$display" | sed 's#[^A-Za-z0-9_.-]#_#g').txt"
+    run_probe "$SMART_TIMEOUT_SECONDS" smartctl -c -l selftest -A "$device" \
+        > "$history_file" 2>&1
+    rc=$?
+    if (( rc == 124 || rc == 137 || (rc & 7) != 0 )) || \
+       ! grep -Eqi 'Self-test supported' "$history_file"; then
+        smart_short_test_note SKIPPED "$display" 'SMART self-test capability/history unreadable'
+        return 0
+    fi
+    status_value=$(sed -nE '/^Self-test execution status:/{s/.*\([[:space:]]*([0-9]+)[[:space:]]*\).*/\1/;p;q;}' \
+        "$history_file")
+    if [[ ! $status_value =~ ^[0-9]+$ ]]; then
+        smart_short_test_note SKIPPED "$display" 'cannot establish whether a self-test is running'
+        return 0
+    fi
+    if (( status_value >= 240 && status_value <= 255 )); then
+        smart_short_test_note SKIPPED "$display" 'firmware reports a self-test already in progress'
+        return 0
+    fi
+
+    latest_line=$(grep -m 1 -E '^#[[:space:]]*[0-9]+[[:space:]]' "$history_file" || true)
+    if [[ -n $latest_line ]]; then
+        previous_note="last logged: $(sanitize_text "$latest_line")"
+    elif grep -Eqi 'No self-tests have been logged' "$history_file"; then
+        previous_note='no prior logged self-tests'
+    else
+        smart_short_test_note SKIPPED "$display" 'self-test history missing/ambiguous'
+        return 0
+    fi
+
+    serial=$(sed -nE '/^(Serial Number|LU WWN Device Id):/{s/^[^:]+:[[:space:]]*//;p;q;}' "$health_output")
+    device_key=$(printf '%s\n%s\n' "$device" "${serial:-$device}" | sha256sum)
+    device_key=${device_key%% *}
+    now=$(date +%s)
+    last_epoch=$(smart_short_test_previous_start "$device_key") || {
+        smart_short_test_note SKIPPED "$display" 'cannot read trusted short-test state file'
+        return 0
+    }
+    if [[ $last_epoch =~ ^[0-9]+$ ]] && (( last_epoch > 0 )) && \
+       (( now < last_epoch || now - last_epoch < SMART_SHORT_TEST_AGE_DAYS * 86400 )); then
+        smart_short_test_note SKIPPED "$display" "last audit-started test within ${SMART_SHORT_TEST_AGE_DAYS}d; $previous_note"
+        return 0
+    fi
+
+    if [[ -n $latest_line && $latest_line != *'Completed without error'* ]]; then
+        smart_short_test_note SKIPPED "$display" "previous self-test was not successful; review drive log; $previous_note"
+        return 0
+    fi
+    if [[ -n $latest_line ]]; then
+        hours_current=''
+        while read -r attr attr_name flag v w thresh type updated when_failed raw extra; do
+            if [[ $attr == 9 && $attr_name == Power_On_Hours && $raw =~ ^[0-9]+$ ]]; then
+                hours_current=$raw
+                break
+            fi
+        done < "$history_file"
+        if [[ $latest_line =~ [[:space:]]([0-9]+)%[[:space:]]+([0-9]+)[[:space:]] ]]; then
+            hours_logged=${BASH_REMATCH[2]}
+        else
+            smart_short_test_note SKIPPED "$display" "cannot determine age of $previous_note"
+            return 0
+        fi
+        if [[ ! $hours_current =~ ^[0-9]+$ ]]; then
+            smart_short_test_note SKIPPED "$display" "power-on hours unavailable; $previous_note"
+            return 0
+        fi
+        # ATA self-test log lifetime hours wrap at 65536; using powered-on
+        # time is a conservative proxy, NOT an exact calendar-age guarantee.
+        delta=$(((hours_current - hours_logged + 65536) % 65536))
+        age_hours=$((SMART_SHORT_TEST_AGE_DAYS * 24))
+        if (( delta < age_hours )); then
+            smart_short_test_note SKIPPED "$display" "last logged test within ${age_hours} powered-on hours; $previous_note"
+            return 0
+        fi
+    fi
+
+    if (( smart_short_test_started_count > 0 )); then
+        smart_short_test_note SKIPPED "$display" 'another short test was started during this audit (one-start limit)'
+        return 0
+    fi
+    if ! smart_cpu_quiet_enough; then
+        if (( smart_cpu_idle_bp < 0 || smart_cpu_iowait_bp < 0 )); then
+            smart_short_test_note SKIPPED "$display" 'CPU idle/iowait measurements unavailable'
+        else
+            smart_short_test_note SKIPPED "$display" "CPU idle=$((smart_cpu_idle_bp/100)).$((smart_cpu_idle_bp%100))% (must >98%), iowait=$((smart_cpu_iowait_bp/100)).$((smart_cpu_iowait_bp%100))% (must <2%)"
+        fi
+        return 0
+    fi
+    if ! smart_short_test_record_start "$device_key" "$now"; then
+        smart_short_test_note SKIPPED "$display" 'unable to save last-start state safely; test not initiated'
+        return 0
+    fi
+    # No -C (captive), no -t force, no waits for completion. smartctl itself
+    # refuses to start over an already-running test unless forced.
+    if run_probe "$SMART_TIMEOUT_SECONDS" smartctl -t short "$device" \
+       > "$history_file.start" 2>&1; then
+        smart_short_test_note STARTED "$display" "non-captive short test initiated; result checked next audit; $previous_note"
+    else
+        smart_short_test_note FAILED "$display" 'smartctl rejected short-test initiation; inspect device output (retry cooldown applies)'
+    fi
+}
+
 run_smart_target() {
     local device=$1
     local device_type=${2:-}
@@ -1629,6 +1877,8 @@ run_smart_target() {
         "$(sanitize_text "$model")" "$(sanitize_text "$health")" \
         >> "$smart_summary_file"
 
+    maybe_start_smart_short_test "$device" "$device_type" "$display_device" "$output_file" "$status"
+
     if [[ $status != OK ]] || is_enabled "$FORCE_REPORT"; then
         printf 'SMART detail for %s [%s]\n' \
             "$(sanitize_text "$display_device")" "$status" >> "$smart_details_file"
@@ -1636,13 +1886,13 @@ run_smart_target() {
         printf 'Focused SMART health query (exit status %s):\n' "$rc" \
             >> "$smart_details_file"
         while IFS= read -r line || [[ -n $line ]]; do
-            printf '%s\n' "$(sanitize_text "$line")" >> "$smart_details_file"
+            printf '%s\n' "$(sanitize_smart_detail_line "$line")" >> "$smart_details_file"
         done < "$output_file"
         if (( extended_collected )); then
             printf '\nSupplemental smartctl -x output (exit status %s; not used for health classification):\n' \
                 "$extended_rc" >> "$smart_details_file"
             while IFS= read -r line || [[ -n $line ]]; do
-                printf '%s\n' "$(sanitize_text "$line")" >> "$smart_details_file"
+                printf '%s\n' "$(sanitize_smart_detail_line "$line")" >> "$smart_details_file"
             done < "$extended_output_file"
         fi
         printf '\n' >> "$smart_details_file"
@@ -1657,6 +1907,9 @@ run_smart_checks() {
 
     : > "$smart_summary_file"
     : > "$smart_details_file"
+    : > "$smart_short_test_notes_file"
+    smart_short_test_started_count=0
+    smart_short_test_skipped_count=0
     : > "$work_dir/megaraid-enumeration-incomplete.txt"
 
     if ! is_enabled "$SMART_CHECK_ENABLED"; then
@@ -2911,8 +3164,9 @@ assemble_finding_ledger() {
 # identity so newly observed failures cannot be hidden by previous ones.
 finding_id() {
     local severity=$1 category=$2 resource=$3 detail=$4 key
-    if [[ $category == KERNEL || $category == PACKAGE || \
-          $category == AUTOMATIC-CHANGE ]]; then
+    if [[ $category == PACKAGE ]]; then
+        key="$severity|$category|$resource"
+    elif [[ $category == KERNEL || $category == AUTOMATIC-CHANGE ]]; then
         key="$severity|$category|$resource|$detail"
     else
         # Distinguish multiple types of finding for the same pool/resource.
@@ -2960,6 +3214,11 @@ prepare_notifications() {
 
     while IFS=$'\t' read -r prev_id prev_sev prev_cat prev_res prev_mail; do
         [[ $prev_id =~ ^[0-9a-f]{64}$ ]] || continue
+        # Migrate old PACKAGE notification IDs to the new path-based key,
+        # preventing spurious resolved/new alerts after updating the script.
+        if [[ $prev_cat == PACKAGE ]]; then
+            prev_id=$(finding_id "$prev_sev" "$prev_cat" "$prev_res" '')
+        fi
         previous_dates[$prev_id]=$prev_mail
         previous_labels[$prev_id]="$prev_sev"$'\t'"$prev_cat"$'\t'"$prev_res"
     done < "$previous_file"
@@ -3079,7 +3338,7 @@ print_terminal_report() {
             'Recent kernel storage scan error'|\
             'Filesystem, RAID, and capacity findings'|\
             'Filesystem and RAID details'|'SMART device summary'|\
-            'SMART details'|'Package files that failed verification'|\
+            'SMART details'|'SMART short self-test activity'|'Package files that failed verification'|\
             'Expected package verification differences ignored'|\
             'Packages not checked because checksum data is absent'|\
             'Raw package verification diagnostics'|'Automatic system changes'|\
@@ -3220,7 +3479,7 @@ build_html_report() {
                     'Recent kernel storage scan error'|\
                     'Filesystem, RAID, and capacity findings'|\
                     'Filesystem and RAID details'|'SMART device summary'|\
-                    'SMART details'|'Package files that failed verification'|\
+                    'SMART details'|'SMART short self-test activity'|'Package files that failed verification'|\
                     'Expected package verification differences ignored'|\
                     'Packages not checked because checksum data is absent'|\
                     'Raw package verification diagnostics'|'Automatic system changes'|\
@@ -3331,6 +3590,12 @@ if ! (( SPACE_NOTICE_PERCENT < SPACE_WARNING_PERCENT && \
     exit 64
 fi
 
+if ! is_nonnegative_integer "$SMART_SHORT_TEST_AGE_DAYS" ||
+   (( SMART_SHORT_TEST_AGE_DAYS < 1 || SMART_SHORT_TEST_AGE_DAYS > 3650 )); then
+    printf '%s: SMART_SHORT_TEST_AGE_DAYS must be an integer from 1 to 3650.\n' "$PROGRAM_NAME" >&2
+    exit 64
+fi
+
 for timeout_value in "$SMART_TIMEOUT_SECONDS" "$PROBE_TIMEOUT_SECONDS" \
     "$JOURNAL_TIMEOUT_SECONDS" "$APT_COMMAND_TIMEOUT_SECONDS" \
     "$DEBSUMS_TIMEOUT_SECONDS" "$RPM_VERIFY_TIMEOUT_SECONDS" \
@@ -3413,6 +3678,10 @@ kernel_export_file="$work_dir/kernel-export.txt"
 kernel_events_file="$work_dir/kernel-events.tsv"
 smart_summary_file="$work_dir/smart-summary.tsv"
 smart_details_file="$work_dir/smart-details.txt"
+smart_short_test_notes_file="$work_dir/smart-short-test-notes.tsv"
+smart_short_test_started_count=0
+smart_short_test_skipped_count=0
+: > "$smart_short_test_notes_file"
 changed_file="$work_dir/changed-files.txt"
 diagnostics_file="$work_dir/debsums-diagnostics.txt"
 diagnostics_safe_file="$work_dir/debsums-diagnostics-safe.txt"
@@ -3453,7 +3722,7 @@ fi
 progress_finish done
 
 failure_context='installing audit prerequisites'
-progress_start 'Checking and installing audit prerequisites'
+progress_start 'Checking audit prerequisites'
 install_missing_audit_tools
 install_status=$?
 if (( install_status != 0 )); then
@@ -3609,6 +3878,11 @@ if is_enabled "$SMART_CHECK_ENABLED"; then
         progress_finish warning
     else
         progress_finish done
+    fi
+    if progress_output_enabled && [[ -s $smart_short_test_notes_file ]]; then
+        while IFS=$'	' read -r test_state test_device test_note; do
+            printf '[SMART-TEST] %s %s: %s\n' "$test_state" "$test_device" "$test_note" >&2
+        done < "$smart_short_test_notes_file"
     fi
 else
     progress_skip 'SMART checks disabled'
@@ -3864,6 +4138,8 @@ change_message=''
     printf 'SMART failures:                 %s\n' "$smart_fail_count"
     printf 'SMART command errors:           %s\n' "$smart_error_count"
     printf 'SMART unsupported devices:      %s\n' "$smart_unsupported_count"
+    printf 'SMART short tests initiated:    %s\n' "$smart_short_test_started_count"
+    printf 'SMART short tests skipped:      %s\n' "$smart_short_test_skipped_count"
     printf 'Changed package files:          %s\n' "$changed_count"
     printf 'Package config/metadata warnings: %s\n' "$package_warning_count"
     if [[ $PACKAGE_BACKEND == rpm ]]; then
@@ -3939,6 +4215,15 @@ change_message=''
         while IFS=$'\t' read -r status device model health; do
             printf '%-12s %-20s %-28s %s\n' "$status" "$device" "$model" "$health"
         done < "$smart_summary_file"
+        printf '\n'
+    fi
+
+    if [[ -s $smart_short_test_notes_file ]]; then
+        printf 'SMART short self-test activity\n'
+        printf -- '------------------------------\n'
+        while IFS=$'\t' read -r action device explanation; do
+            printf '%-9s %-20s %s\n' "$action" "$device" "$explanation"
+        done < "$smart_short_test_notes_file"
         printf '\n'
     fi
 
@@ -4035,7 +4320,7 @@ change_message=''
         printf 'differences produce warnings; timestamp-only changes are skipped unless\n'
         printf 'RPM_REPORT_TIMESTAMP_ONLY=1 is configured. Modified paths may be\n'
     fi
-    printf 'suppressed by exceptions, but MISSING files are never suppressed.\n'
+    printf 'suppressed by exceptions; separately approved missing files remain visible.\n'
     printf '%s does not verify arbitrary local data, and cannot establish that\n' "$PACKAGE_VERIFY_TOOL"
     printf 'the local package database is trustworthy. Embedded-newline filenames\n'
     printf 'remain limited by line-oriented verification output. RPM metadata and\n'
