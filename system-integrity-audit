@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# system-integrity-audit version 2.0.0-dev.4
+# system-integrity-audit version 2.0.0-dev.5
 # DEVELOPMENT PREVIEW: Debian/Ubuntu and Rocky/RHEL RPM backends.
 # Audit kernel/storage health and native package-managed file integrity.
 
@@ -12,11 +12,14 @@ export PATH
 export LC_ALL=C
 
 PROGRAM_NAME='system-integrity-audit'
-PROGRAM_VERSION='2.0.0-dev.4'
+PROGRAM_VERSION='2.0.0-dev.5'
 readonly PROGRAM_NAME PROGRAM_VERSION
 
 # Changelog:
-#   2.0.0-dev.4 (2026-11-12): Add Ubuntu 20.04 LTS (systemd 245)
+#   2.0.0-dev.5 (2026-11-12): Make shared Ubuntu integration tests
+#                          independent of the host package manager by
+#                          mocking dpkg-query on RPM-based test hosts.
+#   2.0.0-dev.5 (2026-11-12): Add Ubuntu 20.04 LTS (systemd 245)
 #                          compatibility coverage, retain bounded legacy
 #                          kernel journal queries, and reject Ubuntu
 #                          releases older than 20.04 as unvalidated.
