@@ -1,0 +1,3706 @@
+#!/usr/bin/env bash
+# system-integrity-audit version 2.0.0-dev.2
+# DEVELOPMENT PREVIEW: Debian/Ubuntu backend only; RPM port is not ready.
+# Audit kernel/storage health and package-managed files (via debsums).
+
+set -u
+set -o pipefail
+umask 077
+
+PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+export PATH
+export LC_ALL=C
+
+PROGRAM_NAME='system-integrity-audit'
+PROGRAM_VERSION='2.0.0-dev.2'
+readonly PROGRAM_NAME PROGRAM_VERSION
+
+# Changelog:
+#   2.0.0-dev.2 (2026-11-12): Add explicit placeholder recipient that
+#                          disables mail without removing email reporting.
+#                          Do not require sendmail or mark notifications as
+#                          delivered when the recipient is a placeholder.
+#   2.0.0-dev.1 (2026-11-12): Start distribution-neutral development branch
+#                          from the tested 1.7.1 Ubuntu implementation.
+#                          Remove campus-specific mail defaults, disable
+#                          automatic host changes by default, and refuse
+#                          unsupported RPM systems until their backend exists.
+#   1.7.1 (2026-11-12): Speed up kernel journal coverage by requesting
+#                          the oldest matching kernel event directly on
+#                          systemd 255+ (Ubuntu 24.04). On older systemd
+#                          (Ubuntu 22.04), stream only the first event,
+#                          accepting expected SIGPIPE while preserving
+#                          probe timeouts and failure/empty-log reporting.
+#   1.7.0 (2026-11-11): Fix severity aggregation, add preflight failure
+#                          email, bounded external probes, boot-aware ATA
+#                          correlation, scoped storage matching, optional
+#                          whole-disk discovery, complete MegaRAID enumeration,
+#                          combined boot-fsck review, truthful stage progress,
+#                          structured finding records, stateful notifications,
+#                          and regression fixtures.
+#   1.6.3 (2026-11-11): Skip Dell BP14G+ enclosure/backplane targets in
+#                          both MegaRAID discovery paths. Deduplicate
+#                          physical drives by WWN or model plus serial,
+#                          across logical RAID devices; preserve unknown
+#                          identities and genuine SMART coverage warnings.
+#   1.6.2 (2026-11-11): Exclude the precise kernel thermal-zone
+#                          sensor-read failure message from storage
+#                          alerts. Keep genuine disk read/write and
+#                          filesystem errors in the audit.
+#   1.6.1 (2026-11-11): Fix the 7-day kernel-journal scan and coverage
+#                          calculation to include all retained boots via
+#                          _TRANSPORT=kernel. journalctl -k implicitly
+#                          restricts results to the current boot, causing
+#                          false post-reboot coverage warnings and omissions.
+#   1.6.0 (2026-09-03): Exclude definite non-disk MegaRAID targets such as
+#                          backplanes, enclosure-services devices, expanders,
+#                          processors, and array-controller management targets
+#                          from SMART physical-drive discovery. Real disks with
+#                          unsupported SMART remain reportable.
+#   1.5.9 (2026-08-10): Recognize ATA link identifiers such as ata2.00
+#                          in failed-to-resume-link messages. Keep isolated
+#                          link resume failures at WARNING, escalate on
+#                          stronger failures for the same link or parent
+#                          ATA port, and avoid sibling-link false escalation.
+#   1.5.8 (2026-08-10): Use a focused SMART health query for normal
+#                          SATA/SAS disks instead of classifying the
+#                          smartctl -x exit status. Keep -x as
+#                          supplemental diagnostics so unsupported
+#                          optional logs do not create false errors.
+#   1.5.7 (2026-08-10): Ignore the informational NVMe driver message
+#                          reporting the configured shutdown timeout. Genuine
+#                          NVMe command timeouts, resets, critical warnings,
+#                          aborts, and other failures remain reportable.
+#   1.5.6 (2026-08-06): Ignore the informational MegaRAID OCR-enabled
+#                          capability message. Classify an isolated ATA
+#                          "failed to resume link" message as WARNING,
+#                          while escalating it to ALERT when the same ATA
+#                          port has associated I/O, identification,
+#                          offline-device, or link-reset failures.
+#   1.5.5 (2026-08-05): Classify current-boot fsck results by the standard
+#                          fsck exit-status bits. Omit clean exit 0 checks,
+#                          report corrected errors as WARNING, and reserve
+#                          ALERT for reboot-required, uncorrected, or
+#                          operational failure results.
+#   1.5.4 (2026-08-04): Treat an explicit unavailable inode percentage
+#                          from a successful df -Pi query as not applicable
+#                          rather than a warning. This covers Btrfs and any
+#                          other filesystem whose driver reports no fixed
+#                          inode accounting, while retaining warnings for
+#                          actual df failures or malformed output.
+#   1.5.3 (2026-07-31): Colorize interactive startup and progress output.
+#                          Use cyan for the active spinner/stage, green for
+#                          successful stages and notices/skips, yellow for
+#                          warnings, and red for failures. Honor NO_COLOR.
+#   1.5.2 (2026-07-31): Add interactive terminal progress output. Display the
+#                          running script filename and version, then show each
+#                          audit stage with an ASCII spinner. Scheduled and
+#                          redirected runs remain quiet by default.
+#   1.5.1 (2026-07-31): Exclude Snap-managed mount targets under
+#                          /var/snap from unexpected read-only mount
+#                          findings while continuing to audit their
+#                          underlying filesystems and storage devices.
+#   1.5 (2026-07-30): Add read-only mount detection, filesystem space and
+#                      inode thresholds, current-boot systemd-fsck review,
+#                      Linux MD RAID status, LVM health/thin-pool checks,
+#                      Btrfs device/scrub status, ZFS pool/scrub status, and
+#                      non-invasive deep-scrub scheduling checks for ext-on-LVM
+#                      and XFS. No repair or scrub operation is started.
+#   1.4.7 (2026-07-30): Exclude the systemd-journald rotation message
+#                        "Failed to read journal file ... Protocol not
+#                        supported" from kernel storage findings. The
+#                        message is not, by itself, a storage-media fault.
+#   1.4.6 (2026-07-30): Classify successful installation of debsums and
+#                        smartmontools as NOTICE rather than WARNING. A
+#                        notice-only run still sends a report, but uses a
+#                        NOTICE subject/status; journald enablement remains
+#                        a WARNING.
+#   1.4.5 (2026-07-30): Detect Dell PERC/MegaRAID logical disks and
+#                        enumerate the controller's physical drives with
+#                        smartctl -d megaraid,N. Avoid treating the logical
+#                        /dev/sdX device as a SMART command failure.
+#   1.4.4 (2026-07-29): Hide the general scope section from terminal output
+#                        and render it in dark gray in the HTML email so it
+#                        remains available without competing with findings.
+#   1.4.3 (2026-07-29): Clarify the final scope section as general
+#                        coverage information, not evidence that a storage
+#                        problem was detected.
+#   1.4.2 (2026-07-29): Set the Postfix/sendmail envelope sender with -f so
+#                        Return-Path and the visible From header both use
+#                        REPORT_FROM_ADDRESS instead of the invoking root user.
+#   1.4.1 (2026-07-29): Report successful automatic system changes as
+#                        warnings. Installing debsums/smartmontools or enabling
+#                        persistent journald storage now forces terminal and
+#                        email output with a dedicated warning section.
+#   1.4 (2026-07-29): Automatically enable persistent systemd-journald
+#                      storage when kernel-log auditing is enabled and
+#                      persistence is not already active. Use a dedicated
+#                      drop-in, flush volatile logs, verify persistent
+#                      storage, and report the one-time configuration change.
+#   1.3.9 (2026-07-29): Detect incomplete kernel-log retention (volatile,
+#                        non-persistent journald storage) and surface it as
+#                        an execution note / storage warning instead of
+#                        silently trusting a truncated --since window.
+#                        Ensure a genuine changed/missing findings set still
+#                        drives ALERT (not just ERROR) classification when
+#                        debsums itself exits with an unexpected status.
+
+REPORT_TO="${REPORT_TO:-username@email.address}"
+REPORT_FROM_NAME="${REPORT_FROM_NAME:-System Integrity Audit}"
+REPORT_FROM_ADDRESS="${REPORT_FROM_ADDRESS:-system-integrity-audit}"
+SUBJECT_PREFIX="${SUBJECT_PREFIX:-[system integrity audit]}"
+REPORT_COVERAGE_GAPS="${REPORT_COVERAGE_GAPS:-1}"
+FORCE_REPORT="${FORCE_REPORT:-0}"
+TERMINAL_OUTPUT="${TERMINAL_OUTPUT:-auto}"
+PROGRESS_OUTPUT="${PROGRESS_OUTPUT:-auto}"
+LOCK_FILE="${LOCK_FILE:-/run/lock/system-integrity-audit.lock}"
+AUTO_INSTALL_REQUIREMENTS="${AUTO_INSTALL_REQUIREMENTS:-0}"
+SMART_CHECK_ENABLED="${SMART_CHECK_ENABLED:-1}"
+KERNEL_LOG_CHECK_ENABLED="${KERNEL_LOG_CHECK_ENABLED:-1}"
+AUTO_ENABLE_PERSISTENT_JOURNAL="${AUTO_ENABLE_PERSISTENT_JOURNAL:-0}"
+JOURNAL_PERSISTENCE_DROPIN="${JOURNAL_PERSISTENCE_DROPIN:-/etc/systemd/journald.conf.d/99-system-integrity-audit.conf}"
+KERNEL_LOG_SINCE="${KERNEL_LOG_SINCE:-7 days ago}"
+FILESYSTEM_CHECKS_ENABLED="${FILESYSTEM_CHECKS_ENABLED:-1}"
+SPACE_NOTICE_PERCENT="${SPACE_NOTICE_PERCENT:-85}"
+SPACE_WARNING_PERCENT="${SPACE_WARNING_PERCENT:-92}"
+SPACE_ALERT_PERCENT="${SPACE_ALERT_PERCENT:-97}"
+INODE_NOTICE_PERCENT="${INODE_NOTICE_PERCENT:-85}"
+INODE_WARNING_PERCENT="${INODE_WARNING_PERCENT:-92}"
+INODE_ALERT_PERCENT="${INODE_ALERT_PERCENT:-97}"
+LVM_THIN_NOTICE_PERCENT="${LVM_THIN_NOTICE_PERCENT:-80}"
+LVM_THIN_WARNING_PERCENT="${LVM_THIN_WARNING_PERCENT:-90}"
+LVM_THIN_ALERT_PERCENT="${LVM_THIN_ALERT_PERCENT:-95}"
+SCRUB_MAX_AGE_DAYS="${SCRUB_MAX_AGE_DAYS:-45}"
+PROC_MDSTAT_PATH="${PROC_MDSTAT_PATH:-/proc/mdstat}"
+SYS_BLOCK_DIR="${SYS_BLOCK_DIR:-/sys/block}"
+APT_LOCK_WAIT_SECONDS="${APT_LOCK_WAIT_SECONDS:-240}"
+APT_LOCK_RETRY_COUNT="${APT_LOCK_RETRY_COUNT:-5}"
+MEGARAID_MAX_INDEX="${MEGARAID_MAX_INDEX:-63}"
+# Bounded, non-destructive probes. timeout(1) also sends KILL after grace.
+SMART_TIMEOUT_SECONDS="${SMART_TIMEOUT_SECONDS:-90}"
+PROBE_TIMEOUT_SECONDS="${PROBE_TIMEOUT_SECONDS:-120}"
+JOURNAL_TIMEOUT_SECONDS="${JOURNAL_TIMEOUT_SECONDS:-180}"
+APT_COMMAND_TIMEOUT_SECONDS="${APT_COMMAND_TIMEOUT_SECONDS:-1800}"
+DEBSUMS_TIMEOUT_SECONDS="${DEBSUMS_TIMEOUT_SECONDS:-7200}"
+ATA_CORRELATION_SECONDS="${ATA_CORRELATION_SECONDS:-120}"
+SMART_ALL_DISKS="${SMART_ALL_DISKS:-0}"
+SMART_EXTENDED_DETAILS="${SMART_EXTENDED_DETAILS:-0}"
+MEGARAID_COMPLETE_SCAN="${MEGARAID_COMPLETE_SCAN:-1}"
+MEGARAID_SCAN_BUDGET_SECONDS="${MEGARAID_SCAN_BUDGET_SECONDS:-240}"
+STATEFUL_NOTIFICATIONS="${STATEFUL_NOTIFICATIONS:-1}"
+NOTIFICATION_REPEAT_DAYS="${NOTIFICATION_REPEAT_DAYS:-7}"
+NOTIFICATION_STATE_FILE="${NOTIFICATION_STATE_FILE:-/var/lib/system-integrity-audit/findings.tsv}"
+EXCEPTIONS_FILE="${EXCEPTIONS_FILE:-/usr/local/etc/system-integrity-audit.ignore}"
+declare -a exception_patterns=()
+exception_pattern_count=0
+OS_RELEASE_FILE="${OS_RELEASE_FILE:-/etc/os-release}"
+
+case "${1:-}" in
+    --version|-V)
+        printf '%s %s\n' "$PROGRAM_NAME" "$PROGRAM_VERSION"
+        exit 0
+        ;;
+    --help|-h)
+        cat <<USAGE
+Usage: $PROGRAM_NAME [--version|--help]
+
+Environment overrides:
+  REPORT_TO=address                 Email recipient (default: username@email.address)
+                                     Placeholder or empty value disables email
+  REPORT_FROM_NAME=name             Sender display name (default: System Integrity Audit)
+  REPORT_FROM_ADDRESS=address       Sender address (default: system-integrity-audit)
+  FORCE_REPORT=1                    Send/display a report even when clean
+  TERMINAL_OUTPUT=auto|always|never Terminal report behavior
+  PROGRESS_OUTPUT=auto|always|never Show startup and test progress
+  NO_COLOR=1                        Disable ANSI terminal colors
+  AUTO_INSTALL_REQUIREMENTS=1       Explicitly allow installing debsums/smartmontools
+  SMART_CHECK_ENABLED=0             Disable SMART checks
+  KERNEL_LOG_CHECK_ENABLED=0        Disable kernel-log scan
+  AUTO_ENABLE_PERSISTENT_JOURNAL=1  Explicitly allow persistent journald setup
+  JOURNAL_PERSISTENCE_DROPIN=path   Journald drop-in managed by this script
+  KERNEL_LOG_SINCE='24 hours ago'   Kernel-log lookback period
+  FILESYSTEM_CHECKS_ENABLED=0       Disable filesystem/RAID/capacity checks
+  SPACE_NOTICE_PERCENT=85           Space-use NOTICE threshold
+  SPACE_WARNING_PERCENT=92          Space-use WARNING threshold
+  SPACE_ALERT_PERCENT=97            Space-use ALERT threshold
+  INODE_NOTICE_PERCENT=85           Inode-use NOTICE threshold
+  INODE_WARNING_PERCENT=92          Inode-use WARNING threshold
+  INODE_ALERT_PERCENT=97            Inode-use ALERT threshold
+  LVM_THIN_NOTICE_PERCENT=80        LVM thin-pool NOTICE threshold
+  LVM_THIN_WARNING_PERCENT=90       LVM thin-pool WARNING threshold
+  LVM_THIN_ALERT_PERCENT=95         LVM thin-pool ALERT threshold
+  SCRUB_MAX_AGE_DAYS=45             NOTICE when recorded scrub is older
+  APT_LOCK_WAIT_SECONDS=240         Seconds between package-lock retries
+  APT_LOCK_RETRY_COUNT=5            Retries after the first lock check
+  MEGARAID_MAX_INDEX=63             Highest physical-drive index to probe if scan fails
+  SMART_ALL_DISKS=1                Also examine unmounted physical disks
+  SMART_EXTENDED_DETAILS=1         Collect smartctl -x even for healthy disks
+  MEGARAID_COMPLETE_SCAN=0         Trust --scan-open; skip complementary probes
+  MEGARAID_SCAN_BUDGET_SECONDS=240 Limit complementary scan duration
+  SMART_TIMEOUT_SECONDS=90         Per-smartctl command deadline
+  PROBE_TIMEOUT_SECONDS=120        Per-RAID/filesystem command deadline
+  JOURNAL_TIMEOUT_SECONDS=180      Journal command deadline
+  APT_COMMAND_TIMEOUT_SECONDS=1800 APT invocation deadline
+  DEBSUMS_TIMEOUT_SECONDS=7200     Package verification deadline
+  ATA_CORRELATION_SECONDS=120      ATA companion-event time window
+  STATEFUL_NOTIFICATIONS=0         Disable suppression of ongoing notices/warnings
+  NOTIFICATION_REPEAT_DAYS=7       Repeat unchanged notices/warnings after 7 days
+  NOTIFICATION_STATE_FILE=/var/lib/system-integrity-audit/findings.tsv
+                                     Root-only state; ALERT/ERROR always emailed
+  EXCEPTIONS_FILE=/usr/local/etc/system-integrity-audit.ignore
+                                     Ignore expected CHANGED paths; shell globs allowed
+                                     MISSING files are never ignored
+USAGE
+        exit 0
+        ;;
+esac
+
+is_enabled() {
+    case "${1:-}" in
+        1|yes|true|on|enabled) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+is_nonnegative_integer() {
+    [[ ${1:-} =~ ^[0-9]+$ ]]
+}
+
+is_percentage_integer() {
+    [[ ${1:-} =~ ^(0|[1-9][0-9]?|100)$ ]]
+}
+
+trim_whitespace() {
+    local value=${1-}
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
+
+sanitize_text() {
+    local value=${1-}
+    value=${value//\\/\\\\}
+    value=${value//$'\033'/\\x1b}
+    value=${value//$'\r'/\\r}
+    value=${value//$'\n'/\\n}
+    value=${value//$'\t'/\\t}
+    value=${value//$'\a'/\\x07}
+    value=${value//$'\b'/\\x08}
+    printf '%s' "$value"
+}
+
+
+load_exception_patterns() {
+    local pattern line_number=0
+
+    exception_patterns=()
+    exception_pattern_count=0
+
+    if [[ ! -e $EXCEPTIONS_FILE ]]; then
+        return 0
+    fi
+
+    if [[ ! -f $EXCEPTIONS_FILE || ! -r $EXCEPTIONS_FILE ]]; then
+        printf '%s: exceptions file is not a readable regular file: %s\n' \
+            "$PROGRAM_NAME" "$EXCEPTIONS_FILE" >&2
+        return 66
+    fi
+
+    while IFS= read -r pattern || [[ -n $pattern ]]; do
+        line_number=$((line_number + 1))
+        pattern=${pattern%$'\r'}
+
+        [[ -z $pattern || $pattern == \#* ]] && continue
+
+        if [[ $pattern != /* ]]; then
+            printf '%s: invalid exception on line %s of %s; patterns must be absolute paths: %s\n' \
+                "$PROGRAM_NAME" "$line_number" "$EXCEPTIONS_FILE" \
+                "$(sanitize_text "$pattern")" >&2
+            return 65
+        fi
+
+        exception_patterns+=("$pattern")
+    done < "$EXCEPTIONS_FILE"
+
+    exception_pattern_count=${#exception_patterns[@]}
+    return 0
+}
+
+changed_path_is_excepted() {
+    local file_path=$1 pattern
+
+    for pattern in "${exception_patterns[@]}"; do
+        # The unquoted right-hand side is intentionally treated as a shell glob.
+        if [[ $file_path == $pattern ]]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+html_escape() {
+    printf '%s' "${1-}" | sed \
+        -e 's/&/\&amp;/g' \
+        -e 's/</\&lt;/g' \
+        -e 's/>/\&gt;/g' \
+        -e 's/"/\&quot;/g' \
+        -e "s/'/\&#39;/g"
+}
+
+print_missing_commands() {
+    local command_name
+    printf '%s cannot start because required commands are missing:\n' "$PROGRAM_NAME" >&2
+    for command_name in "$@"; do
+        printf '  - %s\n' "$command_name" >&2
+    done
+    printf '\nInstall the packages providing these commands and run %s again.\n' \
+        "$PROGRAM_NAME" >&2
+}
+
+require_commands() {
+    local command_name
+    local -a missing=()
+
+    for command_name in "$@"; do
+        if ! command -v "$command_name" >/dev/null 2>&1; then
+            missing+=("$command_name")
+        fi
+    done
+
+    if (( ${#missing[@]} > 0 )); then
+        print_missing_commands "${missing[@]}"
+        return 127
+    fi
+
+    return 0
+}
+
+# GNU timeout limits command execution, including a grace period before KILL.
+# This cannot forcibly wake a process stuck in uninterruptible kernel sleep.
+run_probe() {
+    local seconds=$1 rc command_name
+    shift
+    command_name=${1:-unknown}
+    timeout --signal=TERM --kill-after=5s "$seconds" "$@"
+    rc=$?
+    if (( rc == 124 || rc == 137 )); then
+        printf '%s: TIMEOUT: %s exceeded %s seconds (exit %s).\n' \
+            "$PROGRAM_NAME" "$command_name" "$seconds" "$rc" >&2
+    fi
+    return "$rc"
+}
+
+# A sentinel recipient means no outgoing mail, including early-error mail.
+email_reporting_enabled() {
+    [[ -n $REPORT_TO && $REPORT_TO != username@email.address ]]
+}
+
+# A minimum-viable error email when the audit exits before normal reporting.
+# It intentionally does not depend on the work directory or optional checks.
+preflight_failure_email() {
+    local rc=$1 reason=$2 tmp_base subject host
+    command -v sendmail >/dev/null 2>&1 || return 1
+    command -v mktemp >/dev/null 2>&1 || return 1
+    tmp_base=$(mktemp -d -t system-integrity-audit-failure.XXXXXXXX) || return 1
+    host=$(hostname -f 2>/dev/null || hostname 2>/dev/null || printf 'unknown-host')
+    subject="$SUBJECT_PREFIX ERROR - $host"
+    printf 'system-integrity-audit %s could not complete its audit.
+Exit status: %s
+Stage: %s
+Host: %s
+'         "$PROGRAM_VERSION" "$rc" "$(sanitize_text "$reason")" "$(sanitize_text "$host")" > "$tmp_base/body.txt"
+    printf '<html><body><pre>%s</pre></body></html>
+'         "$(html_escape "$(cat "$tmp_base/body.txt")")" > "$tmp_base/body.html"
+    send_report "$subject" "$tmp_base/body.txt" "$tmp_base/body.html"
+    rc=$?
+    rm -rf -- "$tmp_base"
+    return "$rc"
+}
+
+# Set before the first prerequisite check; normal send_report marks an attempt.
+report_attempted=0
+suppress_exit_report=0
+failure_context='initialization / prerequisite check'
+on_exit() {
+    local rc=$?
+    trap - EXIT
+    if (( rc != 0 && report_attempted == 0 && suppress_exit_report == 0 )); then
+        progress_stop
+        if email_reporting_enabled; then
+            preflight_failure_email "$rc" "${failure_context:-${progress_label:-early termination}}" ||             printf '%s: unable to send early-failure email (exit %s).
+' "$PROGRAM_NAME" "$rc" >&2
+        fi
+    fi
+    cleanup
+}
+
+progress_output_enabled() {
+    case "$PROGRESS_OUTPUT" in
+        auto) [[ -t 2 ]] ;;
+        always|1|yes|true) return 0 ;;
+        never|0|no|false) return 1 ;;
+        *)
+            printf 'Invalid PROGRESS_OUTPUT value: %s\n' "$PROGRESS_OUTPUT" >&2
+            printf 'Use auto, always, or never.\n' >&2
+            return 1
+            ;;
+    esac
+}
+
+progress_color_enabled() {
+    [[ -t 2 && ${TERM:-dumb} != dumb && -z ${NO_COLOR:-} ]]
+}
+
+progress_start() {
+    local label=$1
+    local color_reset='' color_bold='' color_cyan=''
+
+    progress_label=$label
+    progress_spinner_pid=''
+    progress_output_enabled || return 0
+
+    if progress_color_enabled; then
+        color_reset=$'\033[0m'
+        color_bold=$'\033[1m'
+        color_cyan=$'\033[36m'
+    fi
+
+    (
+        local frames='|/-\'
+        local index=0 frame
+        trap 'exit 0' HUP INT TERM
+        while :; do
+            frame=${frames:index%4:1}
+            if [[ -t 2 ]]; then
+                printf '\r\033[K' >&2
+            else
+                printf '\r' >&2
+            fi
+            printf '%s%s[%s]%s %s%s%s' \
+                "$color_bold" "$color_cyan" "$frame" "$color_reset" \
+                "$color_cyan" "$label" "$color_reset" >&2
+            index=$((index + 1))
+            sleep 0.15
+        done
+    ) &
+    progress_spinner_pid=$!
+}
+
+progress_finish() {
+    local result=${1:-done}
+    local marker marker_color=''
+    local color_reset='' color_bold=''
+    local color_green='' color_yellow='' color_red='' color_cyan=''
+
+    progress_output_enabled || return 0
+
+    if [[ -n ${progress_spinner_pid:-} ]]; then
+        kill "$progress_spinner_pid" 2>/dev/null || true
+        wait "$progress_spinner_pid" 2>/dev/null || true
+        progress_spinner_pid=''
+    fi
+
+    if progress_color_enabled; then
+        color_reset=$'\033[0m'
+        color_bold=$'\033[1m'
+        color_green=$'\033[32m'
+        color_yellow=$'\033[33m'
+        color_red=$'\033[31m'
+        color_cyan=$'\033[36m'
+    fi
+
+    case "$result" in
+        done|ok|success)
+            marker='OK'
+            marker_color=$color_green
+            ;;
+        skipped|skip)
+            marker='SKIP'
+            marker_color=$color_cyan
+            ;;
+        notice)
+            marker='NOTICE'
+            marker_color=$color_cyan
+            ;;
+        warning)
+            marker='WARN'
+            marker_color=$color_yellow
+            ;;
+        *)
+            marker='FAIL'
+            marker_color=$color_red
+            ;;
+    esac
+
+    if [[ -t 2 ]]; then
+        printf '\r\033[K' >&2
+    else
+        printf '\r' >&2
+    fi
+    printf '%s%s[%s]%s %s%s%s\n' \
+        "$color_bold" "$marker_color" "$marker" "$color_reset" \
+        "$marker_color" "${progress_label:-Audit stage}" "$color_reset" >&2
+    progress_label=''
+}
+
+progress_stop() {
+    if [[ -n ${progress_spinner_pid:-} ]]; then
+        kill "$progress_spinner_pid" 2>/dev/null || true
+        wait "$progress_spinner_pid" 2>/dev/null || true
+        progress_spinner_pid=''
+        if progress_output_enabled; then
+            if [[ -t 2 ]]; then
+                printf '\r\033[K' >&2
+            else
+                printf '\r' >&2
+            fi
+        fi
+    fi
+}
+
+progress_skip() {
+    progress_label=$1
+    progress_finish skipped
+}
+
+print_startup_banner() {
+    local color_reset='' color_bold='' color_cyan='' color_green='' color_gray=''
+
+    progress_output_enabled || return 0
+
+    if progress_color_enabled; then
+        color_reset=$'\033[0m'
+        color_bold=$'\033[1m'
+        color_cyan=$'\033[36m'
+        color_green=$'\033[32m'
+        color_gray=$'\033[90m'
+    fi
+
+    printf '%s%s%s%s %s%s%s %s(%s)%s\n' \
+        "$color_bold" "$color_cyan" "${0##*/}" "$color_reset" \
+        "$color_green" "$PROGRAM_VERSION" "$color_reset" \
+        "$color_gray" "$PROGRAM_NAME" "$color_reset" >&2
+}
+
+cleanup() {
+    progress_stop
+    if [[ -n ${work_dir:-} && -d ${work_dir:-} ]]; then
+        rm -rf -- "$work_dir"
+    fi
+}
+
+handle_interrupt() {
+    suppress_exit_report=1
+    progress_stop
+    printf '\n%s interrupted.\n' "$PROGRAM_NAME" >&2
+    exit 130
+}
+
+terminal_output_enabled() {
+    case "$TERMINAL_OUTPUT" in
+        auto) [[ -t 1 ]] ;;
+        always|1|yes|true) return 0 ;;
+        never|0|no|false) return 1 ;;
+        *)
+            printf 'Invalid TERMINAL_OUTPUT value: %s\n' "$TERMINAL_OUTPUT" >&2
+            printf 'Use auto, always, or never.\n' >&2
+            return 1
+            ;;
+    esac
+}
+
+active_package_locks() {
+    local lock_path lock_pid lock_command
+
+    while read -r lock_path lock_pid lock_command; do
+        case "$lock_path" in
+            /var/lib/dpkg/lock|/var/lib/dpkg/lock-frontend|\
+            /var/lib/apt/lists/lock|/var/cache/apt/archives/lock)
+                printf '  %s %s %s\n' \
+                    "${lock_command:-unknown}" "${lock_pid:-?}" "$lock_path"
+                ;;
+        esac
+    done < <(lslocks -n -o PATH,PID,COMMAND 2>/dev/null)
+}
+
+package_manager_is_active() {
+    [[ -n $(active_package_locks) ]]
+}
+
+wait_for_package_manager_idle() {
+    local context=${1:-package audit}
+    local attempt=0
+    local lock_details
+
+    while :; do
+        lock_details=$(active_package_locks)
+        if [[ -z $lock_details ]]; then
+            return 0
+        fi
+
+        if (( attempt >= APT_LOCK_RETRY_COUNT )); then
+            printf '%s: package management remained active after %s retries; giving up before %s.\n' \
+                "$PROGRAM_NAME" "$APT_LOCK_RETRY_COUNT" "$context" >&2
+            printf 'Active package-manager locks:\n%s\n' "$lock_details" >&2
+            logger -p user.err -t "$PROGRAM_NAME" \
+                "Package management remained active before $context; giving up."
+            return 75
+        fi
+
+        attempt=$((attempt + 1))
+        printf '%s: package management is active; waiting %s seconds before retry %s of %s (%s).\n' \
+            "$PROGRAM_NAME" "$APT_LOCK_WAIT_SECONDS" "$attempt" \
+            "$APT_LOCK_RETRY_COUNT" "$context" >&2
+        printf 'Active package-manager locks:\n%s\n' "$lock_details" >&2
+        logger -p user.notice -t "$PROGRAM_NAME" \
+            "Package management active; waiting $APT_LOCK_WAIT_SECONDS seconds before retry $attempt of $APT_LOCK_RETRY_COUNT ($context)."
+        sleep "$APT_LOCK_WAIT_SECONDS"
+    done
+}
+
+apt_failure_is_lock_related() {
+    grep -Eqi \
+        'Could not get lock|Unable to acquire the dpkg frontend lock|Unable to lock directory|is another process using it|Could not open lock file' \
+        "$1"
+}
+
+run_apt_get_with_retries() {
+    local operation_name=$1
+    shift
+    local attempt=0
+    local rc
+
+    while :; do
+        : > "$apt_output_file"
+        run_probe "$APT_COMMAND_TIMEOUT_SECONDS" apt-get "$@" >"$apt_output_file" 2>&1
+        rc=$?
+
+        if (( rc == 0 )); then
+            return 0
+        fi
+
+        if ! apt_failure_is_lock_related "$apt_output_file"; then
+            return "$rc"
+        fi
+
+        if (( attempt >= APT_LOCK_RETRY_COUNT )); then
+            printf '%s: APT remained locked after %s retries during %s; giving up.\n' \
+                "$PROGRAM_NAME" "$APT_LOCK_RETRY_COUNT" "$operation_name" >&2
+            cat "$apt_output_file" >&2
+            return 75
+        fi
+
+        attempt=$((attempt + 1))
+        printf '%s: APT is temporarily locked; waiting %s seconds before retry %s of %s (%s).\n' \
+            "$PROGRAM_NAME" "$APT_LOCK_WAIT_SECONDS" "$attempt" \
+            "$APT_LOCK_RETRY_COUNT" "$operation_name" >&2
+        logger -p user.notice -t "$PROGRAM_NAME" \
+            "APT locked; waiting $APT_LOCK_WAIT_SECONDS seconds before retry $attempt of $APT_LOCK_RETRY_COUNT ($operation_name)."
+        sleep "$APT_LOCK_WAIT_SECONDS"
+    done
+}
+
+install_missing_audit_tools() {
+    local -a packages=()
+    local -a missing_commands=()
+    local rc
+
+    if ! command -v debsums >/dev/null 2>&1; then
+        packages+=(debsums)
+        missing_commands+=(debsums)
+    fi
+
+    if is_enabled "$SMART_CHECK_ENABLED" && \
+       ! command -v smartctl >/dev/null 2>&1; then
+        packages+=(smartmontools)
+        missing_commands+=(smartctl)
+    fi
+
+    if (( ${#packages[@]} == 0 )); then
+        return 0
+    fi
+
+    if ! is_enabled "$AUTO_INSTALL_REQUIREMENTS"; then
+        print_missing_commands "${missing_commands[@]}"
+        return 127
+    fi
+
+    if ! command -v apt-get >/dev/null 2>&1; then
+        print_missing_commands apt-get "${missing_commands[@]}"
+        return 127
+    fi
+
+    wait_for_package_manager_idle 'automatic prerequisite installation' || return $?
+
+    printf '%s: installing missing audit package(s): %s\n' \
+        "$PROGRAM_NAME" "${packages[*]}" >&2
+    logger -p user.notice -t "$PROGRAM_NAME" \
+        "Installing missing audit package(s): ${packages[*]}"
+
+    run_apt_get_with_retries 'package installation' \
+        -q -y install "${packages[@]}"
+    rc=$?
+
+    if (( rc != 0 && rc != 75 )); then
+        printf '%s: initial package installation failed; refreshing APT indexes and retrying.\n' \
+            "$PROGRAM_NAME" >&2
+        run_apt_get_with_retries 'APT index refresh' -q update || return $?
+        run_apt_get_with_retries 'package installation retry' \
+            -q -y install "${packages[@]}" || return $?
+    elif (( rc == 75 )); then
+        return 75
+    fi
+
+    if ! command -v debsums >/dev/null 2>&1; then
+        printf '%s: debsums is still unavailable after installation.\n' \
+            "$PROGRAM_NAME" >&2
+        return 127
+    fi
+
+    if is_enabled "$SMART_CHECK_ENABLED" && \
+       ! command -v smartctl >/dev/null 2>&1; then
+        printf '%s: smartctl is still unavailable after installation.\n' \
+            "$PROGRAM_NAME" >&2
+        return 127
+    fi
+
+    automatic_change_count=$((automatic_change_count + 1))
+    automatic_notice_count=$((automatic_notice_count + 1))
+    printf 'NOTICE\tInstalled missing audit package(s): %s.\n' \
+        "$(sanitize_text "${packages[*]}")" >> "$automatic_changes_file"
+
+    logger -p user.notice -t "$PROGRAM_NAME" \
+        'Missing audit prerequisites installed successfully.'
+    return 0
+}
+
+send_report() {
+    email_reporting_enabled || return 0
+    report_attempted=1
+    local subject=$1
+    local text_body_file=$2
+    local html_body_file=$3
+    local boundary from_name_header
+
+    case "$REPORT_TO$REPORT_FROM_NAME$REPORT_FROM_ADDRESS$subject" in
+        *$'\r'*|*$'\n'*)
+            logger -p user.err -t "$PROGRAM_NAME" \
+                'Refusing to send email because a header contains a newline.'
+            return 64
+            ;;
+    esac
+
+    boundary="${PROGRAM_NAME}-${$}-$(date +%s)"
+    from_name_header=$(printf '%s' "$REPORT_FROM_NAME" | sed 's/\\/\\\\/g; s/"/\\"/g')
+
+    {
+        printf 'From: "%s" <%s>\n' "$from_name_header" "$REPORT_FROM_ADDRESS"
+        printf 'To: %s\n' "$REPORT_TO"
+        printf 'Subject: %s\n' "$subject"
+        printf 'MIME-Version: 1.0\n'
+        printf 'Auto-Submitted: auto-generated\n'
+        printf 'X-Auto-Response-Suppress: All\n'
+        printf 'Content-Type: multipart/alternative; boundary="%s"\n' "$boundary"
+        printf '\n'
+        printf 'This is a multipart message in MIME format.\n\n'
+
+        printf -- '--%s\n' "$boundary"
+        printf 'Content-Type: text/plain; charset=UTF-8\n'
+        printf 'Content-Transfer-Encoding: 8bit\n\n'
+        cat "$text_body_file"
+        printf '\n\n'
+
+        printf -- '--%s\n' "$boundary"
+        printf 'Content-Type: text/html; charset=UTF-8\n'
+        printf 'Content-Transfer-Encoding: 8bit\n\n'
+        cat "$html_body_file"
+        printf '\n\n'
+
+        printf -- '--%s--\n' "$boundary"
+    } | sendmail -f "$REPORT_FROM_ADDRESS" -t -oi
+}
+
+lookup_package_owners() {
+    local file_path=$1
+    local raw remaining marker owner
+    local joined=''
+    local -a owners=()
+    local -A seen=()
+
+    raw=$(dpkg-query -S -- "$file_path" 2>/dev/null) || raw=''
+    marker=": $file_path"
+    remaining=$raw
+
+    while [[ -n $remaining && $remaining == *"$marker"* ]]; do
+        owner=${remaining%%"$marker"*}
+        remaining=${remaining#*"$marker"}
+        remaining=${remaining#$'\n'}
+        owner=$(sanitize_text "$owner")
+        if [[ -n $owner && -z ${seen[$owner]+x} ]]; then
+            seen[$owner]=1
+            owners+=("$owner")
+        fi
+    done
+
+    if (( ${#owners[@]} == 0 )) && [[ -n $raw ]]; then
+        owner=$(sanitize_text "$raw")
+        owners+=("$owner")
+    fi
+
+    if (( ${#owners[@]} == 0 )); then
+        printf 'UNKNOWN'
+        return 0
+    fi
+
+    for owner in "${owners[@]}"; do
+        if [[ -n $joined ]]; then
+            joined+=','
+        fi
+        joined+=$owner
+    done
+
+    printf '%s' "$joined"
+}
+
+effective_journal_storage_mode() {
+    local line mode='auto'
+
+    while IFS= read -r line || [[ -n $line ]]; do
+        if [[ $line =~ ^[[:space:]]*Storage[[:space:]]*=[[:space:]]*([A-Za-z]+) ]]; then
+            mode=${BASH_REMATCH[1],,}
+        fi
+    done < <(run_probe "$PROBE_TIMEOUT_SECONDS" systemd-analyze cat-config systemd/journald.conf 2>/dev/null)
+
+    printf '%s' "$mode"
+}
+
+persistent_journal_is_configured() {
+    local mode
+    mode=$(effective_journal_storage_mode)
+
+    case "$mode" in
+        persistent) return 0 ;;
+        auto) [[ -d /var/log/journal ]] ;;
+        *) return 1 ;;
+    esac
+}
+
+verify_persistent_journal_storage() {
+    persistent_journal_is_configured || return 1
+    [[ -d /var/log/journal ]] || return 1
+
+    # After journalctl --flush, at least one readable persistent entry should
+    # be available on a normally running Ubuntu system.
+    run_probe "$JOURNAL_TIMEOUT_SECONDS" journalctl --directory=/var/log/journal -n 1 --no-pager \
+        >/dev/null 2>&1
+}
+
+ensure_persistent_journal_storage() {
+    local dropin_dir desired_content existing_content temp_file
+    local created_dropin=0 persistence_was_configured=0
+
+    kernel_persistence_summary='disabled (KERNEL_LOG_CHECK_ENABLED=0)'
+    is_enabled "$KERNEL_LOG_CHECK_ENABLED" || return 0
+
+    if persistent_journal_is_configured; then
+        persistence_was_configured=1
+        if verify_persistent_journal_storage; then
+            kernel_persistence_summary='persistent (already enabled)'
+            return 0
+        fi
+    fi
+
+    kernel_persistence_summary='not persistent'
+    if [[ $JOURNAL_PERSISTENCE_DROPIN != /* ]]; then
+        printf '%s: JOURNAL_PERSISTENCE_DROPIN must be an absolute path: %s\n' \
+            "$PROGRAM_NAME" "$JOURNAL_PERSISTENCE_DROPIN" >&2
+        kernel_persistence_summary='ERROR (drop-in path is not absolute)'
+        kernel_persistence_error=1
+        return 64
+    fi
+
+    if ! is_enabled "$AUTO_ENABLE_PERSISTENT_JOURNAL"; then
+        kernel_persistence_summary='not persistent (automatic enable disabled)'
+        return 0
+    fi
+
+    if [[ -L $JOURNAL_PERSISTENCE_DROPIN ]] || \
+       { [[ -e $JOURNAL_PERSISTENCE_DROPIN ]] && \
+         [[ ! -f $JOURNAL_PERSISTENCE_DROPIN ]]; }; then
+        printf '%s: journald drop-in is not a regular file: %s\n' \
+            "$PROGRAM_NAME" "$JOURNAL_PERSISTENCE_DROPIN" >&2
+        kernel_persistence_summary='ERROR (unsafe journald drop-in path)'
+        kernel_persistence_error=1
+        return 78
+    fi
+
+    if (( persistence_was_configured == 0 )); then
+        desired_content=$'[Journal]\nStorage=persistent'
+        if [[ -f $JOURNAL_PERSISTENCE_DROPIN ]]; then
+            existing_content=$(cat -- "$JOURNAL_PERSISTENCE_DROPIN")
+            if [[ $existing_content != "$desired_content" ]]; then
+                printf '%s: refusing to overwrite existing journald drop-in: %s\n' \
+                    "$PROGRAM_NAME" "$JOURNAL_PERSISTENCE_DROPIN" >&2
+                kernel_persistence_summary='ERROR (existing drop-in differs)'
+                kernel_persistence_error=1
+                return 78
+            fi
+        else
+            dropin_dir=$(dirname -- "$JOURNAL_PERSISTENCE_DROPIN")
+            mkdir -p -- "$dropin_dir" || {
+                kernel_persistence_summary='ERROR (cannot create drop-in directory)'
+                kernel_persistence_error=1
+                return 1
+            }
+
+            temp_file="$dropin_dir/.debsums-audit-journald.$$"
+            if ! printf '%s\n' "$desired_content" > "$temp_file" || \
+               ! install -o root -g root -m 0644 -- \
+                    "$temp_file" "$JOURNAL_PERSISTENCE_DROPIN"; then
+                rm -f -- "$temp_file"
+                printf '%s: unable to install journald drop-in: %s\n' \
+                    "$PROGRAM_NAME" "$JOURNAL_PERSISTENCE_DROPIN" >&2
+                kernel_persistence_summary='ERROR (cannot install drop-in)'
+                kernel_persistence_error=1
+                return 1
+            fi
+            rm -f -- "$temp_file"
+            created_dropin=1
+        fi
+    fi
+
+    if ! mkdir -p -- /var/log/journal || \
+       ! systemd-tmpfiles --create --prefix /var/log/journal; then
+        printf '%s: unable to prepare /var/log/journal.\n' \
+            "$PROGRAM_NAME" >&2
+        kernel_persistence_summary='ERROR (cannot prepare persistent journal directory)'
+        kernel_persistence_error=1
+        return 1
+    fi
+
+    if ! run_probe "$PROBE_TIMEOUT_SECONDS" systemctl kill --kill-who=main --signal=HUP \
+            systemd-journald.service; then
+        printf '%s: unable to reload systemd-journald configuration.\n' \
+            "$PROGRAM_NAME" >&2
+        kernel_persistence_summary='ERROR (journald reload failed)'
+        kernel_persistence_error=1
+        return 1
+    fi
+
+    if ! run_probe "$JOURNAL_TIMEOUT_SECONDS" journalctl --flush; then
+        printf '%s: unable to flush volatile journal data to persistent storage.\n' \
+            "$PROGRAM_NAME" >&2
+        kernel_persistence_summary='ERROR (journal flush failed)'
+        kernel_persistence_error=1
+        return 1
+    fi
+
+    if ! verify_persistent_journal_storage; then
+        printf '%s: persistent journal storage could not be verified after configuration.\n' \
+            "$PROGRAM_NAME" >&2
+        kernel_persistence_summary='ERROR (persistent storage verification failed)'
+        kernel_persistence_error=1
+        return 1
+    fi
+
+    if (( persistence_was_configured == 0 )); then
+        kernel_persistence_changed=1
+        kernel_persistence_summary="persistent (enabled by $PROGRAM_NAME)"
+        automatic_change_count=$((automatic_change_count + 1))
+        automatic_warning_count=$((automatic_warning_count + 1))
+        printf 'WARNING\tEnabled persistent systemd-journald storage using %s and flushed available volatile journal data.\n' \
+            "$(sanitize_text "$JOURNAL_PERSISTENCE_DROPIN")" \
+            >> "$automatic_changes_file"
+        printf 'Persistent kernel journal storage was enabled using %s. Historical coverage before this run cannot be recovered; the requested lookback window will accumulate over time.\n' \
+            "$(sanitize_text "$JOURNAL_PERSISTENCE_DROPIN")" \
+            >> "$execution_notes_file"
+        logger -p user.notice -t "$PROGRAM_NAME" \
+            "Enabled persistent journald storage using $JOURNAL_PERSISTENCE_DROPIN."
+    elif (( created_dropin )); then
+        # Defensive fallback: normally a newly created drop-in means
+        # persistence was not configured before this function ran.
+        kernel_persistence_changed=1
+        kernel_persistence_summary="persistent (enabled by $PROGRAM_NAME)"
+    else
+        kernel_persistence_summary='persistent (verified)'
+    fi
+
+    return 0
+}
+
+scan_kernel_storage_logs() {
+    local line lower_line stamp epoch ata_port ata_suffix ata_link event_epoch
+    local event_boot event_message warning_boot field micro='' boot='' msg=''
+    local companion_subject found_companion matched_boot
+    local -a storage_patterns=(
+        'blk_update_request|buffer i/o error|end_request: i/o error|critical medium error'
+        'i/o error, dev[[:space:]]|i/o error on dev[[:space:]]|uncorrectable.*(sector|disk|block|ata|scsi|nvme)'
+        'failed command: (read|write)|sense key: (medium error|hardware error)'
+        'ata[0-9]+(\.[0-9]+)?:.*(error|failed|timeout|reset|hard resetting link|link is slow to respond|serror|exception emask)'
+        'nvme.*(error|failed|timeout|reset|critical warning|abort)'
+        'scsi.*(error|failed|timeout|reset)'
+        'sd[a-z0-9]+.*(i/o error|offline|rejecting i/o)'
+        'ext[234]-fs.*(error|warning|corrupt|aborted journal)'
+        'xfs.*(corrupt|metadata i/o error|shutdown|log i/o error)'
+        'btrfs.*(error|corrupt|csum failed|checksum error|read-only)'
+        'zfs.*(error|checksum|faulted|degraded)'
+        'filesystem.*(error|corrupt)|remounting filesystem read-only|remount-ro|read-only filesystem'
+        'megaraid_sas.*(controller reset failed|controller fault|firmware fault|critical error)'
+        'device offline|device.*failed (to read|to write)|block.*failed (to read|to write)'
+    )
+    local error_regex benign_regex ata_companion_regex
+
+    : > "$kernel_findings_file"
+    : > "$kernel_warnings_file"
+    : > "$kernel_scan_error_file"
+    : > "$kernel_events_file"
+    : > "$kernel_raw_file"
+    is_enabled "$KERNEL_LOG_CHECK_ENABLED" || return 0
+
+    # -k selects only the current boot. Explicit transport matching includes
+    # retained historical boots and keeps journal coverage meaningful.
+    if ! run_probe "$JOURNAL_TIMEOUT_SECONDS" journalctl --system \
+        --since "$KERNEL_LOG_SINCE" --no-pager -o short-iso-precise \
+        _TRANSPORT=kernel > "$kernel_raw_file" 2> "$kernel_scan_error_file"; then
+        kernel_scan_error=1
+        return 0
+    fi
+
+    # Export adds boot IDs and event microsecond timestamps, so ATA correlation
+    # cannot accidentally join distant events or separate boots. MESSAGE is
+    # normally a textual field for kernel messages; non-text export fields are
+    # conservatively ignored by this correlation pass.
+    if ! run_probe "$JOURNAL_TIMEOUT_SECONDS" journalctl --system \
+        --since "$KERNEL_LOG_SINCE" --no-pager -o export \
+        _TRANSPORT=kernel > "$kernel_export_file" 2>> "$kernel_scan_error_file"; then
+        kernel_scan_error=1
+        return 0
+    fi
+
+    while IFS= read -r field || [[ -n $field ]]; do
+        case "$field" in
+            __REALTIME_TIMESTAMP=*) micro=${field#*=} ;;
+            _BOOT_ID=*) boot=${field#*=} ;;
+            MESSAGE=*) msg=${field#*=} ;;
+            '')
+                if [[ $micro =~ ^[0-9]{7,}$ && -n $boot && -n $msg ]]; then
+                    event_epoch=$(( micro / 1000000 ))
+                    printf '%s\t%s\t%s\n' "$event_epoch" "$boot" "${msg,,}" >> "$kernel_events_file"
+                fi
+                micro=''; boot=''; msg=''
+                ;;
+        esac
+    done < "$kernel_export_file"
+    if [[ $micro =~ ^[0-9]{7,}$ && -n $boot && -n $msg ]]; then
+        printf '%s\t%s\t%s\n' "$(( micro / 1000000 ))" "$boot" "${msg,,}" >> "$kernel_events_file"
+    fi
+
+    error_regex=$(IFS='|'; printf '%s' "${storage_patterns[*]}")
+    benign_regex='0 errors|no errors|without error|error count[[:space:]]*[:=][[:space:]]*0|corrected error count[[:space:]]*[:=][[:space:]]*0|systemd-journald.*failed to read journal file .* for rotation, trying to move it out of the way: protocol not supported|megaraid_sas.*online controller reset\(ocr\)[[:space:]]*:[[:space:]]*enabled|nvme[[:space:]]+nvme[0-9]+:[[:space:]]*shutdown timeout set to [0-9]+ seconds[[:space:]]*$'
+    benign_regex+='|kernel:[[:space:]]+thermal[[:space:]]+thermal_zone[0-9]+:[[:space:]]+failed to read out thermal zone[[:space:]]+\(-[0-9]+\)[[:space:]]*$'
+    ata_companion_regex='hard resetting link|failed to identify|i/o error|device offline|limiting sata link speed|link is slow to respond|comreset failed|reset failed|failed command: (read|write)|exception emask|serror|status:[[:space:]]*\{[^}]*err'
+
+    grep -Eai -- "$error_regex" "$kernel_raw_file" | \
+        grep -Evai -- "$benign_regex" > "$kernel_matches_raw_file" || true
+
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ -n $line ]] || continue
+        lower_line=${line,,}
+        if [[ $lower_line == *'failed to resume link (scontrol '* ]] && \
+           [[ $lower_line =~ (ata[0-9]+)(\.[0-9]+)?: ]]; then
+            ata_port=${BASH_REMATCH[1]}
+            ata_suffix=${BASH_REMATCH[2]-}
+            ata_link="${ata_port}${ata_suffix}"
+            stamp=${line%% *}
+            epoch=$(date -d "$stamp" +%s 2>/dev/null) || epoch=0
+            warning_boot=''
+            if (( epoch > 0 )); then
+                while IFS=$'\t' read -r event_epoch event_boot event_message; do
+                    [[ $event_message == *"$ata_link: failed to resume link"* ]] || continue
+                    if (( event_epoch >= epoch - 1 && event_epoch <= epoch + 1 )); then
+                        warning_boot=$event_boot
+                        break
+                    fi
+                done < "$kernel_events_file"
+            fi
+            found_companion=0
+            if [[ -n $warning_boot ]]; then
+                while IFS=$'\t' read -r event_epoch event_boot event_message; do
+                    [[ $event_boot == "$warning_boot" ]] || continue
+                    (( event_epoch >= epoch - ATA_CORRELATION_SECONDS && \
+                       event_epoch <= epoch + ATA_CORRELATION_SECONDS )) || continue
+                    if [[ -n $ata_suffix ]]; then
+                        # Exact link or parent port, never a sibling link.
+                        [[ $event_message == *"$ata_link:"* || \
+                           $event_message == *"$ata_port:"* ]] || continue
+                    else
+                        [[ $event_message == *"$ata_port:"* || \
+                           $event_message == *"$ata_port."* ]] || continue
+                    fi
+                    if [[ $event_message =~ $ata_companion_regex ]]; then
+                        found_companion=1
+                        break
+                    fi
+                done < "$kernel_events_file"
+            fi
+            if (( found_companion )); then
+                printf '%s\n' "$(sanitize_text "$line")" >> "$kernel_findings_file"
+            else
+                printf '%s\n' "$(sanitize_text "$line")" >> "$kernel_warnings_file"
+            fi
+        else
+            printf '%s\n' "$(sanitize_text "$line")" >> "$kernel_findings_file"
+        fi
+    done < "$kernel_matches_raw_file"
+}
+# Ubuntu 24.04 defaults to journald Storage=auto and does not create
+# /var/log/journal by default, so unless persistent journal storage has
+# been explicitly enabled, kernel history lives only in a small volatile
+# buffer -- and even with persistent storage, rotation limits (SystemMaxUse)
+# can still cause the same shortfall. This always records how far back the
+# journal actually goes (for the Summary section), and separately flags a
+# genuine gap against KERNEL_LOG_SINCE so it isn't silently trusted.
+check_kernel_log_coverage() {
+    local cutoff_epoch earliest_line earliest_epoch now_epoch
+    local gap_seconds gap_hours coverage_seconds coverage_days earliest_iso
+    local coverage_tolerance_seconds=21600  # 6 hours of slack for rotation jitter
+
+    kernel_coverage_gap=0
+    kernel_coverage_unknown=0
+    kernel_coverage_summary='disabled (KERNEL_LOG_CHECK_ENABLED=0)'
+    is_enabled "$KERNEL_LOG_CHECK_ENABLED" || return 0
+
+    kernel_coverage_summary='unknown (kernel log scan failed)'
+    (( kernel_scan_error > 0 )) && return 0
+
+    kernel_coverage_summary='unknown (kernel journal history unavailable)'
+    # journalctl --lines=+1 selects the oldest matching event on systemd 255+
+    # (Ubuntu 24.04), avoiding a complete export of retained kernel history.
+    # Ubuntu 22.04's systemd 249 lacks +N: stream just one line via head.
+    # The legacy producer may exit 141 (SIGPIPE) when head closes the pipe;
+    # accept that *only* if a valid first line was captured. Other errors,
+    # including probe timeouts, must not be mistaken for usable coverage.
+    local history_file="$work_dir/kernel-coverage-first.txt"
+    local journal_version version_major query_rc=0 head_rc=0
+    local -a coverage_pipe_status=()
+    journal_version=$(run_probe "$JOURNAL_TIMEOUT_SECONDS" journalctl --version 2>/dev/null) || journal_version=''
+    version_major=0
+    if [[ $journal_version =~ ^systemd[[:space:]]+([0-9]+) ]]; then
+        version_major=${BASH_REMATCH[1]}
+    fi
+
+    if (( version_major >= 255 )); then
+        run_probe "$JOURNAL_TIMEOUT_SECONDS" journalctl --system \
+            --lines=+1 -o short-unix --no-pager _TRANSPORT=kernel \
+            > "$history_file" 2>/dev/null
+        query_rc=$?
+    else
+        run_probe "$JOURNAL_TIMEOUT_SECONDS" journalctl --system \
+            -o short-unix --no-pager _TRANSPORT=kernel 2>/dev/null \
+            | head -n 1 > "$history_file"
+        coverage_pipe_status=("${PIPESTATUS[@]}")
+        query_rc=${coverage_pipe_status[0]}
+        head_rc=${coverage_pipe_status[1]}
+    fi
+
+    if (( head_rc != 0 || (query_rc != 0 && \
+          (version_major >= 255 || query_rc != 141)) )); then
+        kernel_coverage_unknown=1
+        printf 'Kernel journal coverage query failed or timed out; the requested lookback cannot be confirmed.\n' \
+            >> "$execution_notes_file"
+        return 0
+    fi
+    earliest_line=$(head -n 1 "$history_file")
+    if [[ -z $earliest_line ]]; then
+        kernel_coverage_unknown=1
+        printf 'No kernel transport entries were found; retention coverage cannot be confirmed.\n' \
+            >> "$execution_notes_file"
+        return 0
+    fi
+
+    earliest_epoch=${earliest_line%% *}
+    earliest_epoch=${earliest_epoch%%.*}
+    if ! is_nonnegative_integer "$earliest_epoch"; then
+        kernel_coverage_unknown=1
+        printf 'Kernel journal coverage query returned an invalid oldest-entry timestamp.\n' \
+            >> "$execution_notes_file"
+        return 0
+    fi
+
+    now_epoch=$(date +%s)
+    coverage_seconds=$(( now_epoch - earliest_epoch ))
+    (( coverage_seconds < 0 )) && coverage_seconds=0
+    coverage_days=$(( coverage_seconds / 86400 ))
+    earliest_iso=$(date -d "@$earliest_epoch" --iso-8601=seconds 2>/dev/null || printf 'unknown time')
+    kernel_coverage_summary="$coverage_days days (oldest entry: $(sanitize_text "$earliest_iso"))"
+
+    # If KERNEL_LOG_SINCE isn't parseable by `date -d` (systemd's time
+    # syntax is a superset of GNU date's in places), the coverage depth
+    # above is still reported, but skip the gap comparison rather than
+    # risk a false positive against an un-parseable window.
+    cutoff_epoch=$(date -d "$KERNEL_LOG_SINCE" +%s 2>/dev/null) || return 0
+    is_nonnegative_integer "$cutoff_epoch" || return 0
+
+    if (( earliest_epoch > cutoff_epoch + coverage_tolerance_seconds )); then
+        kernel_coverage_gap=1
+        gap_seconds=$(( earliest_epoch - cutoff_epoch ))
+        gap_hours=$(( (gap_seconds + 1800) / 3600 ))
+        kernel_coverage_summary+=" -- SHORT OF REQUESTED $(sanitize_text "$KERNEL_LOG_SINCE") WINDOW"
+        if (( kernel_persistence_changed > 0 )); then
+            printf 'Kernel journal history only extends back to %s (%s days), short of the requested "%s" lookback by roughly %s hours. Persistent storage was enabled during this run, but earlier discarded history cannot be recovered; allow the requested window to accumulate.\n' \
+                "$(sanitize_text "$earliest_iso")" \
+                "$coverage_days" \
+                "$(sanitize_text "$KERNEL_LOG_SINCE")" \
+                "$gap_hours" \
+                >> "$execution_notes_file"
+        elif persistent_journal_is_configured; then
+            printf 'Kernel journal history only extends back to %s (%s days), short of the requested "%s" lookback by roughly %s hours even though persistent storage is enabled. The journal may be newly enabled or rotation limits such as SystemMaxUse may be too small.\n' \
+                "$(sanitize_text "$earliest_iso")" \
+                "$coverage_days" \
+                "$(sanitize_text "$KERNEL_LOG_SINCE")" \
+                "$gap_hours" \
+                >> "$execution_notes_file"
+        else
+            printf 'Kernel journal history only extends back to %s (%s days), short of the requested "%s" lookback by roughly %s hours because persistent storage is not active. Automatic enablement is disabled or failed.\n' \
+                "$(sanitize_text "$earliest_iso")" \
+                "$coverage_days" \
+                "$(sanitize_text "$KERNEL_LOG_SINCE")" \
+                "$gap_hours" \
+                >> "$execution_notes_file"
+        fi
+    fi
+}
+
+discover_smart_devices() {
+    local source fstype name type
+    local -A devices=()
+
+    while read -r source fstype; do
+        source=${source%%\[*}
+        case "$source" in
+            /dev/*) ;;
+            *) continue ;;
+        esac
+
+        case "$fstype" in
+            tmpfs|devtmpfs|proc|sysfs|cgroup*|overlay|squashfs|ramfs|tracefs|debugfs)
+                continue
+                ;;
+        esac
+
+        while read -r name type; do
+            if [[ $type == disk && -n $name ]]; then
+                devices[$name]=1
+            fi
+        done < <(lsblk -s -r -n -p -o NAME,TYPE -- "$source" 2>/dev/null)
+    done < <(findmnt -rn -o SOURCE,FSTYPE 2>/dev/null)
+
+    if is_enabled "$SMART_ALL_DISKS"; then
+        # Include unmounted spares and non-mounted disks. Logical md/loop
+        # devices are not physical SMART targets.
+        while read -r name type; do
+            [[ $type == disk && $name == /dev/* ]] || continue
+            case "$name" in /dev/loop*|/dev/ram*|/dev/md*) continue ;; esac
+            devices[$name]=1
+        done < <(run_probe "$PROBE_TIMEOUT_SECONDS" lsblk -dn -p -o NAME,TYPE 2>/dev/null)
+    fi
+
+    if (( ${#devices[@]} > 0 )); then
+        printf '%s\n' "${!devices[@]}" | sort
+    fi
+}
+
+smart_output_is_megaraid_controller() {
+    grep -Eqi \
+        'DELL or MegaRaid controller|MegaRAID controller.*try adding.*-d[[:space:]]+megaraid' \
+        "$1"
+}
+
+smart_output_is_megaraid_non_disk_target() {
+    # A MegaRAID target may represent a physical disk or a management object.
+    # Dell 14G backplanes identify as Product: BP14G+ (sometimes BP14G+EXP),
+    # without the literal word BACKPLANE. Keep unknown SMART-capable disks.
+    grep -Eqi \
+        '^[[:space:]]*Device type:[[:space:]]*(processor|array controller|enclosure services|enclosure|medium changer|communications|printer|scanner|cd/dvd|optical|sequential-access|unknown or no device type)([[:space:]]|$)|^[[:space:]]*(Product|Device Model|Model Number):[[:space:]]*.*(backplane|enclosure|expander)([[:space:]]|$)|^[[:space:]]*(Product|Device Model|Model Number):[[:space:]]*BP[0-9]+G\+([[:space:]]|$|EXP([[:space:]]|$))' \
+        "$1"
+}
+
+smart_megaraid_identity_from_info() {
+    # Emit a conservative, stable physical-drive identity. Never deduplicate
+    # merely by MegaRAID index, model, or logical device path: separate RAID
+    # controllers can reuse indexes, and drives often share the same model.
+    # When identity is unavailable, retain both candidates for coverage.
+    local info_file=$1 wwn serial model
+    wwn=$(sed -nE '/^[[:space:]]*(LU WWN Device Id|WWN Device Id|Logical Unit id|Logical Unit ID):/{s/^[^:]+:[[:space:]]*//;p;q;}' "$info_file")
+    wwn=${wwn//[[:space:]]/}
+    wwn=${wwn,,}
+    # Require a plausibly complete hexadecimal WWN; placeholders like
+    # 'unavailable' must never collapse unrelated physical disks.
+    if [[ $wwn =~ ^(0x)?[0-9a-f]{8,}$ || $wwn =~ ^naa\.[0-9a-f]{8,}$ ]] &&
+       [[ $wwn =~ [1-9a-f] ]]; then
+        printf 'wwn:%s' "$wwn"
+        return 0
+    fi
+
+    serial=$(sed -nE '/^[[:space:]]*(Serial Number|Serial number|Unit serial number|Device Serial):/{s/^[^:]+:[[:space:]]*//;p;q;}' "$info_file")
+    model=$(sed -nE '/^[[:space:]]*(Device Model|Model Number|Product):/{s/^[^:]+:[[:space:]]*//;p;q;}' "$info_file")
+    serial=${serial//[[:space:]]/}
+    model=${model//[[:space:]]/}
+    serial=${serial,,}
+    model=${model,,}
+    if [[ -n $serial && -n $model && $serial != 0 &&
+          $serial != - && $serial != unknown && $serial != n/a &&
+          $serial != none && $serial != notavailable &&
+          $serial =~ [1-9a-z] ]]; then
+        printf 'serial:%s:%s' "$model" "$serial"
+    fi
+}
+
+discover_megaraid_targets() {
+    local base_device=$1
+    local line scan_device scan_type key index probe_file physical_identity
+    local discovered=0 started_at now_epoch
+    local -A seen=()
+
+    # smartctl can enumerate physical disks behind supported MegaRAID/PERC
+    # controllers. Depending on the controller and smartmontools release, the
+    # scan path may be the logical disk (/dev/sda) or a /dev/bus/N pseudo path.
+    while IFS= read -r line || [[ -n $line ]]; do
+        if [[ $line =~ ^([^[:space:]]+)[[:space:]]+-d[[:space:]]+(megaraid,[0-9]+)([[:space:]]|$) ]]; then
+            scan_device=${BASH_REMATCH[1]}
+            scan_type=${BASH_REMATCH[2]}
+            index=${scan_type#megaraid,}
+            probe_file="$work_dir/megaraid-scan-probe-${index}.txt"
+            run_probe "$SMART_TIMEOUT_SECONDS" smartctl -i -d "$scan_type" "$scan_device" \
+                >"$probe_file" 2>&1 || true
+
+            if smart_output_is_megaraid_non_disk_target "$probe_file"; then
+                continue
+            fi
+
+            physical_identity=$(smart_megaraid_identity_from_info "$probe_file")
+            key="$scan_device|$scan_type"
+            if [[ -z ${seen[$key]+x} ]]; then
+                seen[$key]=1
+                printf '%s\t%s\t%s\n' "$scan_device" "$scan_type" "$physical_identity"
+                discovered=$((discovered + 1))
+            fi
+        fi
+    done < <(run_probe "$SMART_TIMEOUT_SECONDS" smartctl --scan-open 2>/dev/null || true)
+
+    if (( discovered > 0 )) && ! is_enabled "$MEGARAID_COMPLETE_SCAN"; then
+        return 0
+    fi
+
+    # Complement --scan-open with bounded index probing. Time-budget this
+    # complete pass: many absent target IDs must not indefinitely stall audit.
+    started_at=$(date +%s)
+    for (( index=0; index<=MEGARAID_MAX_INDEX; index++ )); do
+        now_epoch=$(date +%s)
+        if (( now_epoch - started_at >= MEGARAID_SCAN_BUDGET_SECONDS )); then
+            printf '%s: MegaRAID complete enumeration stopped after %s seconds on %s.\n' \
+                "$PROGRAM_NAME" "$MEGARAID_SCAN_BUDGET_SECONDS" "$base_device" >&2
+            printf '%s\n' "$base_device" >> "$work_dir/megaraid-enumeration-incomplete.txt"
+            break
+        fi
+        probe_file="$work_dir/megaraid-probe-${index}.txt"
+        run_probe "$SMART_TIMEOUT_SECONDS" smartctl -i -d "megaraid,$index" "$base_device" \
+            >"$probe_file" 2>&1 || true
+
+        if grep -Eq '^(Device Model|Model Number|Product|Vendor):' "$probe_file" && \
+           ! grep -Eqi 'No MegaRAID device found|INQUIRY failed|open device:.*failed|Unable to detect device type' "$probe_file" && \
+           ! smart_output_is_megaraid_non_disk_target "$probe_file"; then
+            scan_type="megaraid,$index"
+            physical_identity=$(smart_megaraid_identity_from_info "$probe_file")
+            key="$base_device|$scan_type"
+            if [[ -z ${seen[$key]+x} ]]; then
+                seen[$key]=1
+                printf '%s\t%s\t%s\n' "$base_device" "$scan_type" "$physical_identity"
+            fi
+        fi
+    done
+}
+
+run_smart_target() {
+    local device=$1
+    local device_type=${2:-}
+    local display_device=${3:-$device}
+    local rc extended_rc=0 extended_collected=0 status model health line output_file extended_output_file safe_name
+
+    smart_device_count=$((smart_device_count + 1))
+    safe_name=$(printf '%s-%s' "$display_device" "$device_type" | sed 's#[^A-Za-z0-9_.-]#_#g')
+    output_file="$work_dir/smart-${safe_name}.txt"
+    extended_output_file="$work_dir/smart-${safe_name}-extended.txt"
+
+    # Health classification deliberately uses focused SMART queries. smartctl
+    # -x requests optional logs/features and may return bit 2/4 when a healthy
+    # device simply does not implement one of them. Those extended-query exit
+    # bits must not turn a healthy disk into an ERROR finding.
+    if [[ $device == /dev/nvme* || $device_type == megaraid,* ]]; then
+        if [[ -n $device_type ]]; then
+            run_probe "$SMART_TIMEOUT_SECONDS" smartctl -H -i -A -l error -d "$device_type" "$device" \
+                >"$output_file" 2>&1
+        else
+            run_probe "$SMART_TIMEOUT_SECONDS" smartctl -H -i -A -l error "$device" >"$output_file" 2>&1
+        fi
+    elif [[ -n $device_type ]]; then
+        run_probe "$SMART_TIMEOUT_SECONDS" smartctl -H -i -A -l error -l selftest -d "$device_type" "$device" \
+            >"$output_file" 2>&1
+    else
+        run_probe "$SMART_TIMEOUT_SECONDS" smartctl -H -i -A -l error -l selftest "$device" \
+            >"$output_file" 2>&1
+    fi
+    rc=$?
+
+    # Avoid expensive/problematic extended feature queries on healthy drives.
+    # Classification ALWAYS uses the focused query, never -x.
+    extended_collected=0
+    : > "$extended_output_file"
+
+    if grep -Eqi 'SMART support is: *Unavailable|Unknown USB bridge|Unsupported device|Please specify device type' "$output_file"; then
+        status='UNSUPPORTED'
+        smart_unsupported_count=$((smart_unsupported_count + 1))
+    elif (( rc == 124 || rc == 137 )); then
+        status='ERROR'
+        smart_error_count=$((smart_error_count + 1))
+    elif (( rc & 8 )); then
+        status='FAIL'
+        smart_fail_count=$((smart_fail_count + 1))
+    elif (( rc & 7 )); then
+        status='ERROR'
+        smart_error_count=$((smart_error_count + 1))
+    elif (( rc & 240 )); then
+        status='WARNING'
+        smart_warning_count=$((smart_warning_count + 1))
+    elif ! grep -Eqi \
+        'SMART overall-health self-assessment test result:|SMART Health Status:|Critical Warning:|SMART support is:[[:space:]]*Enabled' \
+        "$output_file"; then
+        status='UNSUPPORTED'
+        smart_unsupported_count=$((smart_unsupported_count + 1))
+    elif grep -Eqi 'overall-health.*FAILED|SMART Health Status:.*(BAD|FAILED)|Critical Warning:[[:space:]]*0x0*[1-9a-f]' "$output_file"; then
+        status='FAIL'
+        smart_fail_count=$((smart_fail_count + 1))
+    else
+        status='OK'
+        smart_ok_count=$((smart_ok_count + 1))
+    fi
+
+    if [[ $status != OK ]] || is_enabled "$FORCE_REPORT" || \
+       is_enabled "$SMART_EXTENDED_DETAILS"; then
+        extended_collected=1
+        if [[ -n $device_type ]]; then
+            run_probe "$SMART_TIMEOUT_SECONDS" smartctl -x -d "$device_type" "$device" \
+                >"$extended_output_file" 2>&1
+            extended_rc=$?
+        else
+            run_probe "$SMART_TIMEOUT_SECONDS" smartctl -x "$device" \
+                >"$extended_output_file" 2>&1
+            extended_rc=$?
+        fi
+    fi
+
+    model=$(sed -nE '/^(Device Model|Model Number|Product):/{s/^[^:]+:[[:space:]]*//;p;q;}' "$output_file")
+    health=$(sed -nE '/^(SMART overall-health self-assessment test result|SMART Health Status):/{s/^[^:]+:[[:space:]]*//;p;q;}' "$output_file")
+    [[ -n $model ]] || model='Unknown model'
+    [[ -n $health ]] || health="smartctl exit status $rc"
+
+    printf '%s\t%s\t%s\t%s\n' \
+        "$status" "$(sanitize_text "$display_device")" \
+        "$(sanitize_text "$model")" "$(sanitize_text "$health")" \
+        >> "$smart_summary_file"
+
+    if [[ $status != OK ]] || is_enabled "$FORCE_REPORT"; then
+        printf 'SMART detail for %s [%s]\n' \
+            "$(sanitize_text "$display_device")" "$status" >> "$smart_details_file"
+        printf -- '----------------------------------------\n' >> "$smart_details_file"
+        printf 'Focused SMART health query (exit status %s):\n' "$rc" \
+            >> "$smart_details_file"
+        while IFS= read -r line || [[ -n $line ]]; do
+            printf '%s\n' "$(sanitize_text "$line")" >> "$smart_details_file"
+        done < "$output_file"
+        if (( extended_collected )); then
+            printf '\nSupplemental smartctl -x output (exit status %s; not used for health classification):\n' \
+                "$extended_rc" >> "$smart_details_file"
+            while IFS= read -r line || [[ -n $line ]]; do
+                printf '%s\n' "$(sanitize_text "$line")" >> "$smart_details_file"
+            done < "$extended_output_file"
+        fi
+        printf '\n' >> "$smart_details_file"
+    fi
+}
+
+run_smart_checks() {
+    local device probe_file target_device target_type target_identity target_key
+    local discovered_count
+    local -a devices=()
+    local -A checked_targets=()
+
+    : > "$smart_summary_file"
+    : > "$smart_details_file"
+    : > "$work_dir/megaraid-enumeration-incomplete.txt"
+
+    if ! is_enabled "$SMART_CHECK_ENABLED"; then
+        return 0
+    fi
+
+    while IFS= read -r device; do
+        [[ -n $device ]] && devices+=("$device")
+    done < <(discover_smart_devices)
+
+    if (( ${#devices[@]} == 0 )); then
+        smart_unsupported_count=1
+        printf 'UNSUPPORTED\t%s\t%s\t%s\n' \
+            '(none discovered)' 'No physical disk found' \
+            'Mounted filesystems did not resolve to a physical disk device.' \
+            >> "$smart_summary_file"
+        return 0
+    fi
+
+    for device in "${devices[@]}"; do
+        if [[ $device == /dev/nvme* ]]; then
+            target_key="$device|direct"
+            if [[ -z ${checked_targets[$target_key]+x} ]]; then
+                checked_targets[$target_key]=1
+                run_smart_target "$device" '' "$device"
+            fi
+            continue
+        fi
+
+        probe_file="$work_dir/smart-controller-probe-$(printf '%s' "$device" | sed 's#[^A-Za-z0-9_.-]#_#g').txt"
+        run_probe "$SMART_TIMEOUT_SECONDS" smartctl -i "$device" >"$probe_file" 2>&1 || true
+
+        if smart_output_is_megaraid_controller "$probe_file"; then
+            discovered_count=0
+            while IFS=$'\t' read -r target_device target_type target_identity; do
+                [[ -n $target_device && -n $target_type ]] || continue
+                discovered_count=$((discovered_count + 1))
+                # Deduplicate by physical drive identity, regardless of which
+                # logical RAID path exposed it. If no stable identity can be
+                # read, do not guess: keep the drive in the audit.
+                if [[ -n $target_identity ]]; then
+                    target_key="physical|$target_identity"
+                else
+                    target_key="path|$target_device|$target_type"
+                fi
+                if [[ -n ${checked_targets[$target_key]+x} ]]; then
+                    continue
+                fi
+                checked_targets[$target_key]=1
+                run_smart_target "$target_device" "$target_type" \
+                    "$device [$target_type]"
+            done < <(discover_megaraid_targets "$device")
+            if grep -Fxq -- "$device" "$work_dir/megaraid-enumeration-incomplete.txt"; then
+                smart_unsupported_count=$((smart_unsupported_count + 1))
+                printf 'UNSUPPORTED\t%s\t%s\t%s\n' \
+                    "$(sanitize_text "$device")" 'MegaRAID enumeration incomplete' \
+                    'Controller index scan reached its configured time budget; some drives may be untested.' \
+                    >> "$smart_summary_file"
+            fi
+
+            # All entries being duplicates does not mean the logical volume
+            # lacks SMART coverage: those disks were checked via another path.
+            if (( discovered_count == 0 )) && \
+               ! grep -Fxq -- "$device" "$work_dir/megaraid-enumeration-incomplete.txt"; then
+                smart_unsupported_count=$((smart_unsupported_count + 1))
+                printf 'UNSUPPORTED\t%s\t%s\t%s\n' \
+                    "$(sanitize_text "$device")" 'Dell PERC/MegaRAID logical disk' \
+                    "No physical drives were discovered through smartctl (probed indexes 0-${MEGARAID_MAX_INDEX})." \
+                    >> "$smart_summary_file"
+            fi
+            continue
+        fi
+
+        target_key="$device|direct"
+        if [[ -z ${checked_targets[$target_key]+x} ]]; then
+            checked_targets[$target_key]=1
+            run_smart_target "$device" '' "$device"
+        fi
+    done
+}
+
+
+decode_findmnt_field() {
+    # findmnt escapes whitespace and other unsafe bytes in machine-readable
+    # output. Decode those escapes only after the fields have been split.
+    printf '%b' "${1-}"
+}
+
+mount_option_present() {
+    local options=${1-}
+    local requested=${2-}
+    case ",$options," in
+        *",$requested,"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+filesystem_is_local_persistent() {
+    local source=$1
+    local fstype=$2
+
+    case "$fstype" in
+        tmpfs|devtmpfs|proc|sysfs|cgroup*|overlay|squashfs|ramfs|tracefs|\
+        debugfs|securityfs|pstore|autofs|fusectl|configfs|efivarfs|mqueue|\
+        hugetlbfs|rpc_pipefs|nsfs|binfmt_misc|iso9660|udf|nfs|nfs4|cifs|\
+        smb3|ceph|glusterfs|9p|fuse.sshfs)
+            return 1
+            ;;
+        zfs|btrfs|ext2|ext3|ext4|xfs|f2fs|jfs|reiserfs|bcachefs|vfat|exfat)
+            return 0
+            ;;
+    esac
+
+    [[ $source == /dev/* ]]
+}
+
+add_filesystem_finding() {
+    local severity=$1 category=$2 resource=$3 detail=$4
+
+    printf '%s\t%s\t%s\t%s\n' \
+        "$(sanitize_text "$severity")" \
+        "$(sanitize_text "$category")" \
+        "$(sanitize_text "$resource")" \
+        "$(sanitize_text "$detail")" >> "$filesystem_findings_file"
+
+    case "$severity" in
+        ALERT) filesystem_alert_count=$((filesystem_alert_count + 1)) ;;
+        WARNING) filesystem_warning_count=$((filesystem_warning_count + 1)) ;;
+        NOTICE) filesystem_notice_count=$((filesystem_notice_count + 1)) ;;
+        OK) filesystem_ok_count=$((filesystem_ok_count + 1)) ;;
+    esac
+}
+
+append_filesystem_details() {
+    local title=$1 source_file=$2 line
+
+    [[ -s $source_file ]] || return 0
+    printf '%s\n' "$(sanitize_text "$title")" >> "$filesystem_details_file"
+    printf -- '----------------------------------------\n' >> "$filesystem_details_file"
+    while IFS= read -r line || [[ -n $line ]]; do
+        printf '%s\n' "$(sanitize_text "$line")" >> "$filesystem_details_file"
+    done < "$source_file"
+    printf '\n' >> "$filesystem_details_file"
+}
+
+collect_local_filesystems() {
+    local source_encoded target_encoded fstype options source target raw_file
+
+    : > "$local_filesystems_file"
+    filesystem_mount_count=0
+    raw_file="$work_dir/findmnt-local-filesystems.txt"
+
+    if ! run_probe "$PROBE_TIMEOUT_SECONDS" findmnt -rn -o SOURCE,TARGET,FSTYPE,OPTIONS > "$raw_file" 2>/dev/null; then
+        filesystem_check_error_count=$((filesystem_check_error_count + 1))
+        add_filesystem_finding WARNING 'MOUNT-CHECK' 'mount table' \
+            'Unable to enumerate mounted filesystems with findmnt.'
+        return 0
+    fi
+
+    while read -r source_encoded target_encoded fstype options; do
+        [[ -n ${source_encoded:-} && -n ${target_encoded:-} && -n ${fstype:-} ]] || continue
+        source=$(decode_findmnt_field "$source_encoded")
+        target=$(decode_findmnt_field "$target_encoded")
+
+        filesystem_is_local_persistent "$source" "$fstype" || continue
+        printf '%s\t%s\t%s\t%s\n' \
+            "$(sanitize_text "$source")" \
+            "$(sanitize_text "$target")" \
+            "$(sanitize_text "$fstype")" \
+            "$(sanitize_text "${options:-}")" >> "$local_filesystems_file"
+        filesystem_mount_count=$((filesystem_mount_count + 1))
+    done < "$raw_file"
+}
+
+classify_percentage() {
+    local value=$1 notice=$2 warning=$3 alert=$4
+
+    if (( value >= alert )); then
+        printf 'ALERT'
+    elif (( value >= warning )); then
+        printf 'WARNING'
+    elif (( value >= notice )); then
+        printf 'NOTICE'
+    else
+        printf 'OK'
+    fi
+}
+
+df_usage_percent() {
+    local mode=$1 target=$2 output line filesystem='' blocks='' used='' available='' percent='' rest=''
+
+    if [[ $mode == inode ]]; then
+        output=$(run_probe "$PROBE_TIMEOUT_SECONDS" df -Pi -- "$target" 2>/dev/null) || return 1
+    else
+        output=$(run_probe "$PROBE_TIMEOUT_SECONDS" df -P -- "$target" 2>/dev/null) || return 1
+    fi
+
+    line=$(printf '%s\n' "$output" | sed -n '$p')
+    read -r filesystem blocks used available percent rest <<< "$line"
+
+    # GNU df uses a dash when a filesystem does not expose fixed inode
+    # accounting. Btrfs commonly reports 0/0/0/-; other current or future
+    # filesystems may use the same explicit unavailable marker. This is a
+    # successful query with a not-applicable result, not a check failure.
+    if [[ $mode == inode && $percent == '-' ]]; then
+        return 2
+    fi
+
+    percent=${percent%%%}
+    is_percentage_integer "$percent" || return 1
+    printf '%s' "$percent"
+}
+
+check_read_only_mounts() {
+    local source target fstype options fstab_options
+
+    while IFS=$'\t' read -r source target fstype options; do
+        [[ -n ${target:-} ]] || continue
+        mount_option_present "$options" ro || continue
+
+        case "$fstype" in
+            iso9660|udf|squashfs) continue ;;
+        esac
+
+        # Snap creates intentional read-only bind mounts beneath /var/snap
+        # without /etc/fstab entries. Ignore those mount targets only; the
+        # backing filesystem remains covered by capacity, kernel, and device
+        # health checks elsewhere in this audit.
+        case "$target" in
+            /var/snap|/var/snap/*) continue ;;
+        esac
+
+        fstab_options=$(run_probe "$PROBE_TIMEOUT_SECONDS" findmnt --fstab --target "$target" -n -o OPTIONS 2>/dev/null | head -n 1)
+        if [[ -n $fstab_options ]] && mount_option_present "$fstab_options" ro; then
+            continue
+        fi
+
+        readonly_mount_count=$((readonly_mount_count + 1))
+        if [[ -n $fstab_options ]]; then
+            add_filesystem_finding ALERT 'READ-ONLY' "$target" \
+                "Mounted read-only, but the /etc/fstab entry does not request ro (source $source, type $fstype)."
+        else
+            add_filesystem_finding WARNING 'READ-ONLY' "$target" \
+                "Mounted read-only and no /etc/fstab entry confirms that this is intentional (source $source, type $fstype)."
+        fi
+    done < "$local_filesystems_file"
+}
+
+check_filesystem_capacity() {
+    local source target fstype options key space_percent inode_percent severity inode_status
+    local -A checked=()
+
+    while IFS=$'\t' read -r source target fstype options; do
+        [[ -n ${target:-} ]] || continue
+        mount_option_present "$options" bind && continue
+
+        key="$source|$fstype"
+        [[ -z ${checked[$key]+x} ]] || continue
+        checked[$key]=1
+        filesystem_unique_count=$((filesystem_unique_count + 1))
+
+        if space_percent=$(df_usage_percent blocks "$target"); then
+            severity=$(classify_percentage "$space_percent" \
+                "$SPACE_NOTICE_PERCENT" "$SPACE_WARNING_PERCENT" "$SPACE_ALERT_PERCENT")
+            if [[ $severity != OK ]]; then
+                capacity_finding_count=$((capacity_finding_count + 1))
+                add_filesystem_finding "$severity" 'SPACE' "$target" \
+                    "$space_percent% of filesystem space is in use (source $source, type $fstype)."
+            fi
+        else
+            filesystem_check_error_count=$((filesystem_check_error_count + 1))
+            add_filesystem_finding WARNING 'SPACE-CHECK' "$target" \
+                "Unable to determine filesystem space usage for $source."
+        fi
+
+        case "$fstype" in
+            vfat|exfat) ;;
+            *)
+                inode_status=0
+                inode_percent=$(df_usage_percent inode "$target") || inode_status=$?
+                case "$inode_status" in
+                    0)
+                        severity=$(classify_percentage "$inode_percent" \
+                            "$INODE_NOTICE_PERCENT" "$INODE_WARNING_PERCENT" "$INODE_ALERT_PERCENT")
+                        if [[ $severity != OK ]]; then
+                            capacity_finding_count=$((capacity_finding_count + 1))
+                            add_filesystem_finding "$severity" 'INODES' "$target" \
+                                "$inode_percent% of filesystem inodes are in use (source $source, type $fstype)."
+                        fi
+                        ;;
+                    2)
+                        inode_not_applicable_count=$((inode_not_applicable_count + 1))
+                        ;;
+                    *)
+                        filesystem_check_error_count=$((filesystem_check_error_count + 1))
+                        add_filesystem_finding WARNING 'INODE-CHECK' "$target" \
+                            "Unable to determine inode usage for $source."
+                        ;;
+                esac
+                ;;
+        esac
+    done < "$local_filesystems_file"
+}
+
+check_boot_fsck_results() {
+    local units_file unit load active sub description result exec_status
+    local unit_log severity status_value serious_bits
+
+    units_file="$work_dir/fsck-units.txt"
+    : > "$units_file"
+
+    if ! run_probe "$PROBE_TIMEOUT_SECONDS" systemctl list-units --all --no-legend --plain \
+            'systemd-fsck*.service' > "$units_file" 2>/dev/null; then
+        filesystem_check_error_count=$((filesystem_check_error_count + 1))
+        add_filesystem_finding WARNING 'FSCK-CHECK' 'current boot' \
+            'Unable to query systemd fsck service results for the current boot.'
+        return 0
+    fi
+
+    while read -r unit load active sub description; do
+        case "$unit" in
+            systemd-fsck-root.service|systemd-fsck-usr.service|systemd-fsck@*.service) ;;
+            *) continue ;;
+        esac
+        fsck_unit_count=$((fsck_unit_count + 1))
+        result=$(run_probe "$PROBE_TIMEOUT_SECONDS" systemctl show "$unit" -p Result --value 2>/dev/null || true)
+        exec_status=$(run_probe "$PROBE_TIMEOUT_SECONDS" systemctl show "$unit" -p ExecMainStatus --value 2>/dev/null || true)
+        unit_log="$work_dir/fsck-$(printf '%s' "$unit" | sed 's#[^A-Za-z0-9_.-]#_#g').txt"
+        run_probe "$JOURNAL_TIMEOUT_SECONDS" journalctl -b -u "$unit" --no-pager -o short-iso-precise \
+            > "$unit_log" 2>/dev/null || true
+
+        severity=''
+
+        # fsck exit status is a bitmask:
+        #   0 clean, 1 errors corrected, 2 corrected/reboot required,
+        #   4 uncorrected errors, and 8/16/32/128 operational failures.
+        # A successful exit 0 is normal boot activity and is not a finding.
+        if is_nonnegative_integer "$exec_status"; then
+            status_value=$exec_status
+            serious_bits=$(( status_value & (2 | 4 | 8 | 16 | 32 | 128) ))
+            if (( serious_bits != 0 )); then
+                severity='ALERT'
+            elif (( status_value & 1 )); then
+                severity='WARNING'
+            elif (( status_value != 0 )); then
+                # Preserve visibility for an unknown future/nonstandard code.
+                severity='ALERT'
+            fi
+        fi
+
+        # Unit failure matters when there is no recognized fsck status that
+        # already explains the outcome.
+        if [[ -z $severity ]] && \
+           [[ $active == failed || $sub == failed || $result == failed ]]; then
+            severity='ALERT'
+        fi
+
+        if grep -Eqi \
+            'UNEXPECTED INCONSISTENCY|errors? left uncorrected|fsck.*failed|manual fsck required|run fsck manually|unrecoverable|cannot continue' \
+            "$unit_log"; then
+            severity='ALERT'
+        elif [[ -z $severity ]] && grep -Eqi \
+            'recovering journal|journal recovery|errors? corrected|filesystem modified|file system was modified|repaired|fixed' \
+            "$unit_log"; then
+            severity='WARNING'
+        fi
+
+        [[ -n $severity ]] || continue
+        fsck_finding_count=$((fsck_finding_count + 1))
+        add_filesystem_finding "$severity" 'BOOT-FSCK' "$unit" \
+            "Current-boot filesystem check result=${result:-unknown}, exit=${exec_status:-unknown}."
+        append_filesystem_details "Boot fsck detail for $unit [$severity]" "$unit_log"
+    done < "$units_file"
+
+    # Always inspect the current-boot tag even if other fsck units remain
+    # loaded: unloaded failed units would otherwise be overlooked. Compare
+    # only unmatched messages to avoid duplicate findings from loaded units.
+    unit_log="$work_dir/fsck-current-boot-journal.txt"
+    if ! run_probe "$JOURNAL_TIMEOUT_SECONDS" journalctl -b -t systemd-fsck --no-pager \
+        -o short-iso-precise > "$unit_log" 2>/dev/null; then
+        filesystem_check_error_count=$((filesystem_check_error_count + 1))
+        add_filesystem_finding WARNING 'FSCK-CHECK' 'current boot journal' \
+            'Unable to inspect current-boot fsck journal messages.'
+    fi
+    local unmatched_file="$work_dir/fsck-journal-unmatched.txt"
+    local seen_units_file="$work_dir/fsck-unit-logs.txt" journal_line
+    : > "$unmatched_file"
+    : > "$seen_units_file"
+    for journal_line in "$work_dir"/fsck-systemd-fsck*.txt; do
+        [[ -f $journal_line ]] && cat "$journal_line" >> "$seen_units_file"
+    done
+    while IFS= read -r journal_line || [[ -n $journal_line ]]; do
+        [[ -n $journal_line ]] || continue
+        # Drop matching unit messages; retained tag-only messages can be from
+        # units already unloaded by systemd during this boot.
+        if ! grep -Fqx -- "$journal_line" "$seen_units_file"; then
+            printf '%s\n' "$journal_line" >> "$unmatched_file"
+        fi
+    done < "$unit_log"
+    severity=''
+    if grep -Eqi \
+        'UNEXPECTED INCONSISTENCY|errors? left uncorrected|fsck.*failed|manual fsck required|run fsck manually|unrecoverable|cannot continue' \
+        "$unmatched_file"; then
+        severity='ALERT'
+    elif grep -Eqi \
+        'recovering journal|journal recovery|errors? corrected|filesystem modified|file system was modified|repaired|fixed' \
+        "$unmatched_file"; then
+        severity='WARNING'
+    fi
+    if [[ -n $severity ]]; then
+        fsck_finding_count=$((fsck_finding_count + 1))
+        add_filesystem_finding "$severity" 'BOOT-FSCK' 'current boot journal' \
+            'Additional filesystem-check issues were reported in the current boot journal.'
+        append_filesystem_details "Current-boot fsck journal detail [$severity]" "$unmatched_file"
+    fi
+}
+
+check_md_raid_status() {
+    local md_dir md_name device degraded array_state sync_action mismatch_cnt
+    local sync_speed details_file before_findings
+    local -a md_dirs=()
+
+    shopt -s nullglob
+    md_dirs=("$SYS_BLOCK_DIR"/md*/md)
+    shopt -u nullglob
+
+    for md_dir in "${md_dirs[@]}"; do
+        md_name=${md_dir%/md}
+        md_name=${md_name##*/}
+        device="/dev/$md_name"
+        md_array_count=$((md_array_count + 1))
+        before_findings=$((filesystem_alert_count + filesystem_warning_count + filesystem_notice_count))
+
+        degraded=$(cat "$md_dir/degraded" 2>/dev/null || printf 'unknown')
+        array_state=$(cat "$md_dir/array_state" 2>/dev/null || printf 'unknown')
+        sync_action=$(cat "$md_dir/sync_action" 2>/dev/null || printf 'unknown')
+        mismatch_cnt=$(cat "$md_dir/mismatch_cnt" 2>/dev/null || printf 'unknown')
+        sync_speed=$(cat "$md_dir/sync_speed" 2>/dev/null || printf 'unknown')
+
+        if is_nonnegative_integer "$degraded" && (( degraded > 0 )); then
+            add_filesystem_finding ALERT 'MD-RAID' "$device" \
+                "$degraded RAID member(s) are degraded or missing (array state $array_state)."
+        fi
+
+        case "$array_state" in
+            inactive|clear|broken|suspended)
+                add_filesystem_finding ALERT 'MD-RAID' "$device" \
+                    "Array state is $array_state."
+                ;;
+            readonly|read-auto)
+                add_filesystem_finding WARNING 'MD-RAID' "$device" \
+                    "Array is in $array_state state."
+                ;;
+        esac
+
+        case "$sync_action" in
+            idle|unknown|'') ;;
+            check)
+                add_filesystem_finding NOTICE 'MD-SCRUB' "$device" \
+                    "A RAID consistency check is in progress (speed ${sync_speed} KiB/s)."
+                ;;
+            frozen)
+                add_filesystem_finding WARNING 'MD-RAID' "$device" \
+                    'RAID synchronization is frozen; verify recovery progress.'
+                ;;
+            *)
+                add_filesystem_finding WARNING 'MD-RAID' "$device" \
+                    "RAID $sync_action is in progress (speed ${sync_speed} KiB/s)."
+                ;;
+        esac
+
+        if is_nonnegative_integer "$mismatch_cnt" && (( mismatch_cnt > 0 )); then
+            add_filesystem_finding WARNING 'MD-MISMATCH' "$device" \
+                "Kernel RAID mismatch count is $mismatch_cnt."
+        fi
+
+        if (( filesystem_alert_count + filesystem_warning_count + filesystem_notice_count > before_findings )) || \
+           is_enabled "$FORCE_REPORT"; then
+            details_file="$work_dir/md-${md_name}.txt"
+            {
+                printf 'Kernel MD state for %s\n' "$device"
+                printf 'array_state=%s\n' "$array_state"
+                printf 'degraded=%s\n' "$degraded"
+                printf 'sync_action=%s\n' "$sync_action"
+                printf 'sync_speed=%s KiB/s\n' "$sync_speed"
+                printf 'mismatch_cnt=%s\n' "$mismatch_cnt"
+                if [[ -r $PROC_MDSTAT_PATH ]]; then
+                    printf '\n%s\n' "$PROC_MDSTAT_PATH"
+                    cat "$PROC_MDSTAT_PATH"
+                fi
+                if command -v mdadm >/dev/null 2>&1; then
+                    printf '\nmdadm --detail %s\n' "$device"
+                    run_probe "$PROBE_TIMEOUT_SECONDS" mdadm --detail "$device" 2>&1 || true
+                fi
+            } > "$details_file"
+            append_filesystem_details "Linux MD RAID detail for $device" "$details_file"
+        fi
+    done
+
+    if (( md_array_count > 0 )) && ! command -v mdadm >/dev/null 2>&1; then
+        add_filesystem_finding NOTICE 'MD-CHECK' 'mdadm' \
+            'mdadm is not installed; kernel sysfs status was checked, but detailed member metadata is unavailable.'
+    fi
+}
+
+extract_scrub_age_days() {
+    local date_text=$1 scrub_epoch now_epoch
+
+    [[ -n $date_text ]] || return 1
+    scrub_epoch=$(date -d "$date_text" +%s 2>/dev/null) || return 1
+    now_epoch=$(date +%s)
+    (( scrub_epoch <= now_epoch )) || return 1
+    printf '%s' "$(( (now_epoch - scrub_epoch) / 86400 ))"
+}
+
+check_btrfs_status() {
+    local source target fstype options key stats_file scrub_file line value
+    local error_count=0 corrected_count=0 uncorrectable_count=0
+    local scrub_date scrub_age before_findings
+    local -A checked=()
+
+    while IFS=$'\t' read -r source target fstype options; do
+        [[ $fstype == btrfs ]] || continue
+        key=$source
+        [[ -z ${checked[$key]+x} ]] || continue
+        checked[$key]=1
+        btrfs_filesystem_count=$((btrfs_filesystem_count + 1))
+
+        if ! command -v btrfs >/dev/null 2>&1; then
+            add_filesystem_finding NOTICE 'BTRFS-CHECK' "$target" \
+                'btrfs-progs is not installed; device counters and scrub history were not checked.'
+            continue
+        fi
+
+        before_findings=$((filesystem_alert_count + filesystem_warning_count + filesystem_notice_count))
+        stats_file="$work_dir/btrfs-stats-${btrfs_filesystem_count}.txt"
+        scrub_file="$work_dir/btrfs-scrub-${btrfs_filesystem_count}.txt"
+
+        if run_probe "$PROBE_TIMEOUT_SECONDS" btrfs device stats "$target" > "$stats_file" 2>&1; then
+            error_count=0
+            while IFS= read -r line || [[ -n $line ]]; do
+                value=${line##*[[:space:]]}
+                if is_nonnegative_integer "$value" && (( value > 0 )); then
+                    error_count=$((error_count + value))
+                fi
+            done < "$stats_file"
+            if (( error_count > 0 )); then
+                add_filesystem_finding ALERT 'BTRFS-DEVICE' "$target" \
+                    "$error_count accumulated nonzero Btrfs device error counter(s) were reported."
+            fi
+        else
+            filesystem_check_error_count=$((filesystem_check_error_count + 1))
+            add_filesystem_finding WARNING 'BTRFS-CHECK' "$target" \
+                'Unable to read Btrfs device error counters.'
+        fi
+
+        if run_probe "$PROBE_TIMEOUT_SECONDS" btrfs scrub status "$target" > "$scrub_file" 2>&1; then
+            corrected_count=$(sed -nE 's/.*corrected[_ ]errors:[[:space:]]*([0-9]+).*/\1/Ip' "$scrub_file" | head -n 1)
+            uncorrectable_count=$(sed -nE 's/.*uncorrectable[_ ]errors:[[:space:]]*([0-9]+).*/\1/Ip' "$scrub_file" | head -n 1)
+            corrected_count=${corrected_count:-0}
+            uncorrectable_count=${uncorrectable_count:-0}
+
+            if is_nonnegative_integer "$uncorrectable_count" && (( uncorrectable_count > 0 )); then
+                add_filesystem_finding ALERT 'BTRFS-SCRUB' "$target" \
+                    "The last scrub reported $uncorrectable_count uncorrectable error(s)."
+            elif grep -Eqi 'with[[:space:]]+[1-9][0-9]*[[:space:]]+errors?' "$scrub_file"; then
+                add_filesystem_finding ALERT 'BTRFS-SCRUB' "$target" \
+                    'The last scrub reported filesystem errors; review the scrub details.'
+            elif grep -Eqi 'error summary:[[:space:]]*(no errors found|0 errors)' "$scrub_file"; then
+                :
+            elif grep -Eqi 'error summary:' "$scrub_file"; then
+                add_filesystem_finding ALERT 'BTRFS-SCRUB' "$target" \
+                    'The last scrub reported filesystem errors; review the scrub details.'
+            elif is_nonnegative_integer "$corrected_count" && (( corrected_count > 0 )); then
+                add_filesystem_finding WARNING 'BTRFS-SCRUB' "$target" \
+                    "The last scrub corrected $corrected_count error(s)."
+            fi
+
+            if grep -Eqi 'status:[[:space:]]*(running|in progress)|scrub.*running' "$scrub_file"; then
+                add_filesystem_finding NOTICE 'BTRFS-SCRUB' "$target" \
+                    'A Btrfs scrub is currently in progress.'
+            elif grep -Eqi 'status:[[:space:]]*(canceled|cancelled|aborted)|scrub.*(canceled|cancelled|aborted)' "$scrub_file"; then
+                add_filesystem_finding WARNING 'BTRFS-SCRUB' "$target" \
+                    'The recorded Btrfs scrub was canceled or aborted.'
+            elif grep -Eqi 'no stats available|no scrub history|scrub.*not found' "$scrub_file"; then
+                add_filesystem_finding NOTICE 'BTRFS-SCRUB' "$target" \
+                    'No completed Btrfs scrub history is recorded.'
+            fi
+
+            scrub_date=$(sed -nE \
+                's/^[[:space:]]*(Scrub started|scrub started at):?[[:space:]]*//Ip' \
+                "$scrub_file" | head -n 1)
+            if scrub_age=$(extract_scrub_age_days "$scrub_date"); then
+                if (( scrub_age > SCRUB_MAX_AGE_DAYS )); then
+                    add_filesystem_finding NOTICE 'BTRFS-SCRUB' "$target" \
+                        "The recorded scrub is $scrub_age days old (threshold $SCRUB_MAX_AGE_DAYS days)."
+                fi
+            fi
+        else
+            if grep -Eqi 'no stats available|no scrub history' "$scrub_file"; then
+                add_filesystem_finding NOTICE 'BTRFS-SCRUB' "$target" \
+                    'No completed Btrfs scrub history is recorded.'
+            else
+                filesystem_check_error_count=$((filesystem_check_error_count + 1))
+                add_filesystem_finding WARNING 'BTRFS-CHECK' "$target" \
+                    'Unable to read Btrfs scrub status.'
+            fi
+        fi
+
+        if (( filesystem_alert_count + filesystem_warning_count + filesystem_notice_count > before_findings )) || \
+           is_enabled "$FORCE_REPORT"; then
+            append_filesystem_details "Btrfs device statistics for $target" "$stats_file"
+            append_filesystem_details "Btrfs scrub status for $target" "$scrub_file"
+        fi
+    done < "$local_filesystems_file"
+}
+
+check_zfs_status() {
+    local pool pools_file status_file state errors_line scan_line scrub_date scrub_age
+    local before_findings zfs_mount_count=0 source target fstype options
+
+    while IFS=$'\t' read -r source target fstype options; do
+        [[ $fstype == zfs ]] && zfs_mount_count=$((zfs_mount_count + 1))
+    done < "$local_filesystems_file"
+
+    if ! command -v zpool >/dev/null 2>&1; then
+        if (( zfs_mount_count > 0 )); then
+            add_filesystem_finding NOTICE 'ZFS-CHECK' 'zpool' \
+                'ZFS filesystems are mounted, but zpool is unavailable; pool health was not checked.'
+        fi
+        return 0
+    fi
+
+    pools_file="$work_dir/zfs-pools.txt"
+    if ! run_probe "$PROBE_TIMEOUT_SECONDS" zpool list -H -o name > "$pools_file" 2>/dev/null; then
+        if (( zfs_mount_count > 0 )); then
+            filesystem_check_error_count=$((filesystem_check_error_count + 1))
+            add_filesystem_finding WARNING 'ZFS-CHECK' 'all pools' \
+                'Unable to enumerate ZFS pools.'
+        fi
+        return 0
+    fi
+
+    while IFS= read -r pool || [[ -n $pool ]]; do
+        [[ -n $pool ]] || continue
+        zfs_pool_count=$((zfs_pool_count + 1))
+        before_findings=$((filesystem_alert_count + filesystem_warning_count + filesystem_notice_count))
+        status_file="$work_dir/zpool-$(printf '%s' "$pool" | sed 's#[^A-Za-z0-9_.-]#_#g').txt"
+
+        if ! run_probe "$PROBE_TIMEOUT_SECONDS" zpool status -v "$pool" > "$status_file" 2>&1; then
+            filesystem_check_error_count=$((filesystem_check_error_count + 1))
+            add_filesystem_finding WARNING 'ZFS-CHECK' "$pool" \
+                'zpool status returned an error; pool health could not be fully evaluated.'
+        fi
+
+        state=$(sed -nE 's/^[[:space:]]*state:[[:space:]]*//p' "$status_file" | head -n 1)
+        errors_line=$(sed -nE 's/^[[:space:]]*errors:[[:space:]]*//p' "$status_file" | head -n 1)
+        scan_line=$(sed -nE 's/^[[:space:]]*scan:[[:space:]]*//p' "$status_file" | head -n 1)
+
+        if [[ -n $state && $state != ONLINE ]]; then
+            add_filesystem_finding ALERT 'ZFS-POOL' "$pool" \
+                "Pool state is $state."
+        fi
+        if [[ -n $errors_line && $errors_line != 'No known data errors' ]]; then
+            add_filesystem_finding ALERT 'ZFS-DATA' "$pool" "$errors_line"
+        fi
+
+        if [[ $scan_line =~ with[[:space:]]+([1-9][0-9]*)[[:space:]]+errors? ]]; then
+            add_filesystem_finding ALERT 'ZFS-SCRUB' "$pool" \
+                "The recorded scan reports ${BASH_REMATCH[1]} error(s)."
+        elif [[ $scan_line =~ ^resilver.*in[[:space:]]+progress ]]; then
+            add_filesystem_finding WARNING 'ZFS-RESILVER' "$pool" "$scan_line"
+        elif [[ $scan_line =~ ^scrub.*in[[:space:]]+progress ]]; then
+            add_filesystem_finding NOTICE 'ZFS-SCRUB' "$pool" "$scan_line"
+        elif [[ $scan_line =~ (canceled|cancelled|aborted) ]]; then
+            add_filesystem_finding WARNING 'ZFS-SCRUB' "$pool" "$scan_line"
+        elif [[ $scan_line == 'none requested' || -z $scan_line ]]; then
+            add_filesystem_finding NOTICE 'ZFS-SCRUB' "$pool" \
+                'No completed ZFS scrub history is recorded.'
+        fi
+
+        if [[ $scan_line == *' on '* ]]; then
+            scrub_date=${scan_line##* on }
+            if scrub_age=$(extract_scrub_age_days "$scrub_date"); then
+                if (( scrub_age > SCRUB_MAX_AGE_DAYS )); then
+                    add_filesystem_finding NOTICE 'ZFS-SCRUB' "$pool" \
+                        "The recorded scan is $scrub_age days old (threshold $SCRUB_MAX_AGE_DAYS days)."
+                fi
+            fi
+        fi
+
+        if (( filesystem_alert_count + filesystem_warning_count + filesystem_notice_count > before_findings )) || \
+           is_enabled "$FORCE_REPORT"; then
+            append_filesystem_details "ZFS pool status for $pool" "$status_file"
+        fi
+    done < "$pools_file"
+}
+
+check_lvm_status() {
+    local lvs_file lvs_error_file fields_with_health=1
+    local vg lv attr segtype health data_percent metadata_percent copy_percent
+    local resource health_lower health_char severity whole
+
+    if ! command -v lvs >/dev/null 2>&1; then
+        if lsblk -rn -o TYPE 2>/dev/null | grep -qx 'lvm'; then
+            add_filesystem_finding NOTICE 'LVM-CHECK' 'lvs' \
+                'LVM devices are present, but lvs is unavailable; LV health and thin-pool usage were not checked.'
+        fi
+        return 0
+    fi
+
+    lvs_file="$work_dir/lvs-status.txt"
+    lvs_error_file="$work_dir/lvs-status-error.txt"
+    if ! run_probe "$PROBE_TIMEOUT_SECONDS" lvs --noheadings --separator '|' \
+            -o vg_name,lv_name,lv_attr,segtype,lv_health_status,data_percent,metadata_percent,copy_percent \
+            > "$lvs_file" 2> "$lvs_error_file"; then
+        fields_with_health=0
+        if ! run_probe "$PROBE_TIMEOUT_SECONDS" lvs --noheadings --separator '|' \
+                -o vg_name,lv_name,lv_attr,segtype,data_percent,metadata_percent,copy_percent \
+                > "$lvs_file" 2> "$lvs_error_file"; then
+            filesystem_check_error_count=$((filesystem_check_error_count + 1))
+            add_filesystem_finding WARNING 'LVM-CHECK' 'all logical volumes' \
+                'Unable to query LVM logical-volume status.'
+            append_filesystem_details 'LVM query error' "$lvs_error_file"
+            return 0
+        fi
+    fi
+
+    while IFS='|' read -r vg lv attr segtype health data_percent metadata_percent copy_percent; do
+        if (( fields_with_health == 0 )); then
+            copy_percent=$metadata_percent
+            metadata_percent=$data_percent
+            data_percent=$health
+            health=''
+        fi
+
+        vg=$(trim_whitespace "$vg")
+        lv=$(trim_whitespace "$lv")
+        attr=$(trim_whitespace "$attr")
+        segtype=$(trim_whitespace "$segtype")
+        health=$(trim_whitespace "$health")
+        data_percent=$(trim_whitespace "$data_percent")
+        metadata_percent=$(trim_whitespace "$metadata_percent")
+        copy_percent=$(trim_whitespace "$copy_percent")
+        [[ -n $vg && -n $lv ]] || continue
+
+        lvm_volume_count=$((lvm_volume_count + 1))
+        resource="$vg/$lv"
+        health_lower=${health,,}
+
+        if [[ -n $health_lower && $health_lower != healthy && $health_lower != ok && $health_lower != '-' ]]; then
+            if [[ $health_lower =~ writemostly|write-mostly ]]; then
+                :
+            elif [[ $health_lower =~ partial|mismatch|failed|invalid|unknown ]]; then
+                add_filesystem_finding ALERT 'LVM-HEALTH' "$resource" \
+                    "LVM health status is $health."
+            else
+                add_filesystem_finding WARNING 'LVM-HEALTH' "$resource" \
+                    "LVM health status is $health."
+            fi
+        elif [[ -z $health_lower || $health_lower == '-' ]]; then
+            # Older LVM releases may not expose lv_health_status. Fall back to
+            # the ninth lv_attr position: p=partial, m=mismatches, r=refresh.
+            health_char=${attr:8:1}
+            case "$health_char" in
+                p|m)
+                    add_filesystem_finding ALERT 'LVM-HEALTH' "$resource" \
+                        "LVM attribute string $attr indicates a partial LV or RAID mismatches."
+                    ;;
+                r)
+                    add_filesystem_finding WARNING 'LVM-HEALTH' "$resource" \
+                        "LVM attribute string $attr indicates that a RAID LV refresh is needed."
+                    ;;
+            esac
+        fi
+
+        if [[ $segtype == thin-pool || $segtype == cache-pool ]]; then
+            if [[ $data_percent =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+                whole=${data_percent%%.*}
+                severity=$(classify_percentage "$whole" \
+                    "$LVM_THIN_NOTICE_PERCENT" "$LVM_THIN_WARNING_PERCENT" "$LVM_THIN_ALERT_PERCENT")
+                if [[ $severity != OK ]]; then
+                    add_filesystem_finding "$severity" 'LVM-DATA' "$resource" \
+                        "$segtype data usage is $data_percent%."
+                fi
+            fi
+            if [[ $metadata_percent =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+                whole=${metadata_percent%%.*}
+                severity=$(classify_percentage "$whole" \
+                    "$LVM_THIN_NOTICE_PERCENT" "$LVM_THIN_WARNING_PERCENT" "$LVM_THIN_ALERT_PERCENT")
+                if [[ $severity != OK ]]; then
+                    add_filesystem_finding "$severity" 'LVM-METADATA' "$resource" \
+                        "$segtype metadata usage is $metadata_percent%."
+                fi
+            fi
+        fi
+
+        if [[ $segtype == raid* && $copy_percent =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+            whole=${copy_percent%%.*}
+            if (( whole < 100 )); then
+                add_filesystem_finding NOTICE 'LVM-RAID' "$resource" \
+                    "LVM RAID synchronization is $copy_percent% complete."
+            fi
+        fi
+    done < "$lvs_file"
+}
+
+check_timer_health() {
+    local timer=$1 service=$2 label=$3 resource=$4
+    local enabled active result exit_status last_trigger age
+
+    enabled=$(run_probe "$PROBE_TIMEOUT_SECONDS" systemctl is-enabled "$timer" 2>/dev/null || true)
+    active=$(run_probe "$PROBE_TIMEOUT_SECONDS" systemctl is-active "$timer" 2>/dev/null || true)
+    result=$(run_probe "$PROBE_TIMEOUT_SECONDS" systemctl show "$service" -p Result --value 2>/dev/null || true)
+    exit_status=$(run_probe "$PROBE_TIMEOUT_SECONDS" systemctl show "$service" -p ExecMainStatus --value 2>/dev/null || true)
+    last_trigger=$(run_probe "$PROBE_TIMEOUT_SECONDS" systemctl show "$timer" -p LastTriggerUSec --value 2>/dev/null || true)
+
+    if [[ $result == failed ]] || \
+       { is_nonnegative_integer "$exit_status" && (( exit_status != 0 )); }; then
+        add_filesystem_finding WARNING 'DEEP-CHECK' "$resource" \
+            "$label last service result=${result:-unknown}, exit=${exit_status:-unknown}."
+    fi
+
+    case "$enabled" in
+        enabled|enabled-runtime|static) ;;
+        *)
+            add_filesystem_finding NOTICE 'DEEP-CHECK' "$resource" \
+                "$label timer $timer is ${enabled:-not installed}; this audit does not enable or start it."
+            return 0
+            ;;
+    esac
+
+    if [[ $active != active ]]; then
+        add_filesystem_finding NOTICE 'DEEP-CHECK' "$resource" \
+            "$label timer $timer is enabled but not active."
+    fi
+
+    case "$last_trigger" in
+        ''|n/a|never)
+            add_filesystem_finding NOTICE 'DEEP-CHECK' "$resource" \
+                "$label timer has no recorded run time."
+            ;;
+        *)
+            if age=$(extract_scrub_age_days "$last_trigger"); then
+                if (( age > SCRUB_MAX_AGE_DAYS )); then
+                    add_filesystem_finding NOTICE 'DEEP-CHECK' "$resource" \
+                        "$label last ran $age days ago (threshold $SCRUB_MAX_AGE_DAYS days)."
+                fi
+            fi
+            ;;
+    esac
+}
+
+check_deep_scrub_scheduling() {
+    local source target fstype options type
+    local ext_lvm_found=0 xfs_found=0
+
+    while IFS=$'\t' read -r source target fstype options; do
+        case "$fstype" in
+            ext2|ext3|ext4)
+                type=$(run_probe "$PROBE_TIMEOUT_SECONDS" lsblk -dn -o TYPE -- "$source" 2>/dev/null | head -n 1)
+                [[ $type == lvm ]] && ext_lvm_found=1
+                ;;
+            xfs)
+                xfs_found=1
+                ;;
+        esac
+    done < "$local_filesystems_file"
+
+    if (( ext_lvm_found )); then
+        deep_check_target_count=$((deep_check_target_count + 1))
+        if command -v e2scrub_all >/dev/null 2>&1; then
+            check_timer_health 'e2scrub_all.timer' 'e2scrub_all.service' \
+                'ext-on-LVM e2scrub' 'e2scrub_all'
+        else
+            add_filesystem_finding NOTICE 'DEEP-CHECK' 'e2scrub_all' \
+                'An ext filesystem is on LVM, but e2scrub_all is unavailable; no online metadata scrub is started by this audit.'
+        fi
+    fi
+
+    if (( xfs_found )); then
+        deep_check_target_count=$((deep_check_target_count + 1))
+        if command -v xfs_scrub_all >/dev/null 2>&1; then
+            check_timer_health 'xfs_scrub_all.timer' 'xfs_scrub_all.service' \
+                'XFS online scrub' 'xfs_scrub_all'
+        else
+            add_filesystem_finding NOTICE 'DEEP-CHECK' 'xfs_scrub_all' \
+                'XFS is mounted, but xfs_scrub_all is unavailable; no online scrub is started by this audit.'
+        fi
+    fi
+}
+
+run_filesystem_checks() {
+    : > "$filesystem_findings_file"
+    : > "$filesystem_details_file"
+    : > "$local_filesystems_file"
+
+    is_enabled "$FILESYSTEM_CHECKS_ENABLED" || return 0
+
+    collect_local_filesystems
+    check_read_only_mounts
+    check_filesystem_capacity
+    check_boot_fsck_results
+    check_md_raid_status
+    check_btrfs_status
+    check_zfs_status
+    check_lvm_status
+    check_deep_scrub_scheduling
+
+    sort -u "$filesystem_findings_file" -o "$filesystem_findings_file"
+}
+
+run_debsums_once() {
+    : > "$changed_file"
+    : > "$diagnostics_file"
+    : > "$coverage_file"
+
+    run_probe "$DEBSUMS_TIMEOUT_SECONDS" debsums -ca >"$changed_file" 2>"$diagnostics_file"
+    debsums_status=$?
+
+    run_probe "$DEBSUMS_TIMEOUT_SECONDS" debsums -l >"$coverage_file" 2>>"$diagnostics_file"
+    coverage_status=$?
+}
+
+run_debsums_consistently() {
+    local retry=0
+    local lock_details
+
+    while :; do
+        wait_for_package_manager_idle 'debsums audit' || return $?
+        run_debsums_once
+
+        lock_details=$(active_package_locks)
+        if [[ -z $lock_details ]]; then
+            return 0
+        fi
+
+        if (( retry >= APT_LOCK_RETRY_COUNT )); then
+            printf '%s: package management repeatedly overlapped the debsums scan; giving up.\n' \
+                "$PROGRAM_NAME" >&2
+            printf 'Active package-manager locks:\n%s\n' "$lock_details" >&2
+            return 75
+        fi
+
+        retry=$((retry + 1))
+        printf '%s: package management started during debsums; discarding results and waiting %s seconds before retry %s of %s.\n' \
+            "$PROGRAM_NAME" "$APT_LOCK_WAIT_SECONDS" "$retry" \
+            "$APT_LOCK_RETRY_COUNT" >&2
+        logger -p user.warning -t "$PROGRAM_NAME" \
+            "Package management overlapped debsums; discarding results and retrying ($retry/$APT_LOCK_RETRY_COUNT)."
+        sleep "$APT_LOCK_WAIT_SECONDS"
+    done
+}
+
+build_package_findings() {
+    local file_path package_owners line package_name
+    local include_diagnostic
+
+    : > "$findings_file"
+    : > "$ignored_findings_file"
+    : > "$diagnostics_safe_file"
+    : > "$coverage_safe_file"
+
+    while IFS= read -r file_path || [[ -n $file_path ]]; do
+        [[ -n $file_path ]] || continue
+        package_owners=$(lookup_package_owners "$file_path")
+
+        if changed_path_is_excepted "$file_path"; then
+            printf 'IGNORED\t%s\t%s\n' \
+                "$package_owners" "$(sanitize_text "$file_path")" \
+                >> "$ignored_findings_file"
+        else
+            printf 'CHANGED\t%s\t%s\n' \
+                "$package_owners" "$(sanitize_text "$file_path")" \
+                >> "$findings_file"
+        fi
+    done < "$changed_file"
+
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ -n $line ]] || continue
+        include_diagnostic=1
+
+        if [[ $line =~ ^debsums:\ missing\ file\ (.*)\ \(from\ (.*)\ package\)$ ]]; then
+            file_path=${BASH_REMATCH[1]}
+            package_name=${BASH_REMATCH[2]}
+            # Missing files are never suppressed by the exceptions file.
+            printf 'MISSING\t%s\t%s\n' \
+                "$(sanitize_text "$package_name")" \
+                "$(sanitize_text "$file_path")" >> "$findings_file"
+        elif [[ $line =~ ^debsums:\ changed\ file\ (.*)\ \(from\ (.*)\ package\)$ ]]; then
+            file_path=${BASH_REMATCH[1]}
+            package_name=${BASH_REMATCH[2]}
+
+            if changed_path_is_excepted "$file_path"; then
+                printf 'IGNORED\t%s\t%s\n' \
+                    "$(sanitize_text "$package_name")" \
+                    "$(sanitize_text "$file_path")" >> "$ignored_findings_file"
+                include_diagnostic=0
+            else
+                printf 'CHANGED\t%s\t%s\n' \
+                    "$(sanitize_text "$package_name")" \
+                    "$(sanitize_text "$file_path")" >> "$findings_file"
+            fi
+        fi
+
+        if (( include_diagnostic )); then
+            printf '%s\n' "$(sanitize_text "$line")" >> "$diagnostics_safe_file"
+        fi
+    done < "$diagnostics_file"
+
+    while IFS= read -r package_name || [[ -n $package_name ]]; do
+        [[ -n $package_name ]] || continue
+        printf '%s\n' "$(sanitize_text "$package_name")" >> "$coverage_safe_file"
+    done < "$coverage_file"
+
+    sort -u "$findings_file" -o "$findings_file"
+    sort -u "$ignored_findings_file" -o "$ignored_findings_file"
+    sort -u "$coverage_safe_file" -o "$coverage_safe_file"
+
+    changed_count=$(grep -c '^CHANGED' "$findings_file" || true)
+    missing_count=$(grep -c '^MISSING' "$findings_file" || true)
+    ignored_changed_count=$(grep -c '^IGNORED' "$ignored_findings_file" || true)
+    coverage_count=$(grep -c '.' "$coverage_safe_file" || true)
+}
+
+# All classification is derived from a single normalized finding ledger.
+# Severity, category, resource and detail are tab-delimited and sanitized.
+record_finding() {
+    local severity=$1 category=$2 resource=$3 detail=$4
+    printf '%s\t%s\t%s\t%s\n' \
+        "$(sanitize_text "$severity")" "$(sanitize_text "$category")" \
+        "$(sanitize_text "$resource")" "$(sanitize_text "$detail")" \
+        >> "$findings_events_file"
+}
+
+assemble_finding_ledger() {
+    local severity category resource detail status device model health
+    : > "$findings_events_file"
+    while IFS=$'\t' read -r severity category resource detail; do
+        [[ -n $severity ]] || continue
+        record_finding "$severity" "$category" "$resource" "$detail"
+    done < "$filesystem_findings_file"
+
+    while IFS= read -r detail || [[ -n $detail ]]; do
+        [[ -n $detail ]] && record_finding ALERT 'KERNEL' 'kernel journal' "$detail"
+    done < "$kernel_findings_file"
+    while IFS= read -r detail || [[ -n $detail ]]; do
+        [[ -n $detail ]] && record_finding WARNING 'KERNEL' 'kernel journal' "$detail"
+    done < "$kernel_warnings_file"
+
+    while IFS=$'\t' read -r status device model health; do
+        case "$status" in
+            FAIL) severity=ALERT ;;
+            ERROR) severity=ERROR ;;
+            WARNING|UNSUPPORTED) severity=WARNING ;;
+            *) continue ;;
+        esac
+        record_finding "$severity" 'SMART' "$device" "$status $model: $health"
+    done < "$smart_summary_file"
+    while IFS=$'\t' read -r status resource detail; do
+        case "$status" in
+            MISSING|CHANGED) record_finding ALERT 'DEBSUMS' "$detail" "$status $resource" ;;
+        esac
+    done < "$findings_file"
+
+    if (( execution_error > 0 || kernel_persistence_error > 0 || kernel_scan_error > 0 )); then
+        record_finding ERROR 'EXECUTION' 'audit' \
+            'One or more audit checks could not be completed; see execution notes.'
+    fi
+    if (( kernel_coverage_gap > 0 || kernel_coverage_unknown > 0 )); then
+        record_finding WARNING 'JOURNAL-COVERAGE' 'kernel journal' "$kernel_coverage_summary"
+    fi
+    if (( kernel_persistence_changed > 0 )); then
+        record_finding WARNING 'JOURNAL-CONFIG' 'persistent storage' 'Persistence enabled during this audit.'
+    fi
+    if (( coverage_alert > 0 )); then
+        record_finding WARNING 'PACKAGE-COVERAGE' 'debsums' \
+            "$coverage_count installed package(s) have no checksum manifests."
+    fi
+    while IFS=$'\t' read -r severity detail; do
+        [[ -n $severity ]] || continue
+        record_finding "$severity" 'AUTOMATIC-CHANGE' 'system configuration' "$detail"
+    done < "$automatic_changes_file"
+    sort -u "$findings_events_file" -o "$findings_events_file"
+}
+
+# The event key keeps stable conditions stable across changing percentages,
+# ages, or counters. Kernel occurrences and file mismatches use their complete
+# identity so newly observed failures cannot be hidden by previous ones.
+finding_id() {
+    local severity=$1 category=$2 resource=$3 detail=$4 key
+    if [[ $category == KERNEL || $category == DEBSUMS || \
+          $category == AUTOMATIC-CHANGE ]]; then
+        key="$severity|$category|$resource|$detail"
+    else
+        # Distinguish multiple types of finding for the same pool/resource.
+        key="$severity|$category|$resource|$(printf '%s' "$detail" | \
+            sed -E 's/[0-9]+/#/g; s/[[:space:]]+/ /g')"
+    fi
+    printf '%s' "$key" | sha256sum | sed 's/ .*//'
+}
+
+# States are stored as id, severity, category, resource, last mailed time.
+# Only NOTICES and WARNINGS are coalesced. ALERT and ERROR always send.
+# RESOLVED entries force a notice email even with no remaining findings.
+prepare_notifications() {
+    local id severity category resource detail previous last_sent now
+    local previous_file="$work_dir/previous-findings.tsv" prev_id prev_sev prev_cat prev_res
+    local prev_mail current_line
+    local -A previous_dates=() previous_labels=() current_ids=() seen=()
+
+    : > "$notification_next_state_file"
+    : > "$resolved_findings_file"
+    : > "$previous_file"
+    notification_new_count=0
+    notification_ongoing_count=0
+    notification_resolved_count=0
+    notification_due=0
+    event_alert_count=0
+    event_error_count=0
+    event_warning_count=0
+    event_notice_count=0
+    now=$(date +%s)
+    state_now=$now
+
+    if is_enabled "$STATEFUL_NOTIFICATIONS" && [[ -f $NOTIFICATION_STATE_FILE && \
+         ! -L $NOTIFICATION_STATE_FILE ]]; then
+        if [[ -r $NOTIFICATION_STATE_FILE ]]; then
+            cp -- "$NOTIFICATION_STATE_FILE" "$previous_file"
+        else
+            record_finding ERROR 'STATE' 'notification state' \
+                'Cannot read notification state; no findings will be suppressed.'
+        fi
+    elif is_enabled "$STATEFUL_NOTIFICATIONS" && [[ -L $NOTIFICATION_STATE_FILE ]]; then
+        record_finding ERROR 'STATE' 'notification state' \
+            'Notification state file is a symlink; refusing to use it.'
+    fi
+
+    while IFS=$'\t' read -r prev_id prev_sev prev_cat prev_res prev_mail; do
+        [[ $prev_id =~ ^[0-9a-f]{64}$ ]] || continue
+        previous_dates[$prev_id]=$prev_mail
+        previous_labels[$prev_id]="$prev_sev"$'\t'"$prev_cat"$'\t'"$prev_res"
+    done < "$previous_file"
+
+    while IFS=$'\t' read -r severity category resource detail; do
+        [[ -n $severity ]] || continue
+        case "$severity" in
+            ALERT) event_alert_count=$((event_alert_count + 1)); notification_due=1 ;;
+            ERROR) event_error_count=$((event_error_count + 1)); notification_due=1 ;;
+            WARNING) event_warning_count=$((event_warning_count + 1)) ;;
+            NOTICE) event_notice_count=$((event_notice_count + 1)) ;;
+        esac
+        id=$(finding_id "$severity" "$category" "$resource" "$detail")
+        [[ -n ${seen[$id]+x} ]] && continue
+        seen[$id]=1
+        current_ids[$id]=1
+        previous=${previous_dates[$id]-}
+        if [[ -z ${previous_labels[$id]+x} ]]; then
+            notification_new_count=$((notification_new_count + 1))
+            notification_due=1
+            last_sent=0
+        else
+            notification_ongoing_count=$((notification_ongoing_count + 1))
+            last_sent=$previous
+            if ! is_nonnegative_integer "$last_sent" || \
+               (( now - last_sent >= NOTIFICATION_REPEAT_DAYS * 86400 )); then
+                notification_due=1
+            fi
+        fi
+        # Last notification changes only AFTER a successful email send.
+        printf '%s\t%s\t%s\t%s\t%s\n' \
+            "$id" "$severity" "$category" "$resource" "$last_sent" \
+            >> "$notification_next_state_file"
+    done < "$findings_events_file"
+
+    if is_enabled "$STATEFUL_NOTIFICATIONS"; then
+        for id in "${!previous_labels[@]}"; do
+            if [[ -z ${current_ids[$id]+x} ]]; then
+                notification_resolved_count=$((notification_resolved_count + 1))
+                printf '%s\n' "${previous_labels[$id]}" >> "$resolved_findings_file"
+                notification_due=1
+            fi
+        done
+    fi
+    sort -u "$resolved_findings_file" -o "$resolved_findings_file"
+    if ! is_enabled "$STATEFUL_NOTIFICATIONS"; then
+        # Preserve old behavior if notification state is disabled.
+        (( event_alert_count + event_error_count + event_warning_count + event_notice_count > 0 )) && notification_due=1
+    fi
+}
+
+save_notification_state() {
+    local emailed=${1:-0} directory tmp id severity category resource last_sent
+    is_enabled "$STATEFUL_NOTIFICATIONS" || return 0
+    [[ $NOTIFICATION_STATE_FILE == /* && ! -L $NOTIFICATION_STATE_FILE ]] || return 1
+    directory=${NOTIFICATION_STATE_FILE%/*}
+    # Never follow a symlink for the final directory when running as root.
+    [[ ! -L $directory ]] || return 1
+    mkdir -p -- "$directory" || return 1
+    chmod 0700 -- "$directory" || return 1
+    tmp=$(mktemp "$directory/.findings.XXXXXXXX") || return 1
+    if (( emailed )); then
+        while IFS=$'\t' read -r id severity category resource last_sent; do
+            [[ -n $id ]] || continue
+            printf '%s\t%s\t%s\t%s\t%s\n' \
+                "$id" "$severity" "$category" "$resource" "$state_now"
+        done < "$notification_next_state_file" > "$tmp"
+    else
+        cat "$notification_next_state_file" > "$tmp"
+    fi
+    chmod 0600 -- "$tmp" || { rm -f -- "$tmp"; return 1; }
+    if ! mv -f -- "$tmp" "$NOTIFICATION_STATE_FILE"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+}
+
+print_terminal_report() {
+    local report_path=$1
+    local report_state=$2
+    local line line_color state_color
+    local color_reset='' color_bold='' color_red='' color_green=''
+    local color_yellow='' color_cyan=''
+
+    terminal_output_enabled || return 0
+
+    if [[ -t 1 && ${TERM:-dumb} != dumb && -z ${NO_COLOR:-} ]]; then
+        color_reset=$'\033[0m'
+        color_bold=$'\033[1m'
+        color_red=$'\033[31m'
+        color_green=$'\033[32m'
+        color_yellow=$'\033[33m'
+        color_cyan=$'\033[36m'
+    fi
+
+    case "$report_state" in
+        ALERT|ERROR) state_color=$color_red ;;
+        WARNING) state_color=$color_yellow ;;
+        NOTICE) state_color=$color_cyan ;;
+        *) state_color=$color_green ;;
+    esac
+
+    printf '%s%sAudit status: %s%s\n\n' \
+        "$color_bold" "$state_color" "$report_state" "$color_reset"
+
+    while IFS= read -r line || [[ -n $line ]]; do
+        # The scope section is general explanatory boilerplate intended for
+        # the email report, not actionable terminal output. It is always the
+        # final section, so stop before printing it.
+        [[ $line == 'Scope and interpretation' ]] && break
+
+        line_color=''
+
+        case "$line" in
+            'Ubuntu storage and package integrity audit'|'Audit coverage'|'Summary'|\
+            'Recent kernel storage alerts'|'Recent kernel storage warnings'|\
+            'Recent kernel storage scan error'|\
+            'Filesystem, RAID, and capacity findings'|\
+            'Filesystem and RAID details'|'SMART device summary'|\
+            'SMART details'|'Package files that failed verification'|\
+            'Expected changed package files ignored'|\
+            'Packages not checked because checksum data is absent'|\
+            'Raw debsums diagnostics'|'Automatic system changes'|\
+            'Audit execution notes'|'Resolved since previous audit')
+                line_color="${color_bold}${color_cyan}"
+                ;;
+            ALERT*|KERNEL*|CHANGED*|MISSING*|FAIL*|ERROR*|IMPORTANT:*)
+                line_color="${color_bold}${color_red}"
+                ;;
+            WARNING*|UNSUPPORTED*)
+                line_color="${color_bold}${color_yellow}"
+                ;;
+            NOTICE*|RESOLVED*)
+                line_color="${color_bold}${color_cyan}"
+                ;;
+            OK*|IGNORED*)
+                line_color="${color_bold}${color_green}"
+                ;;
+            'Kernel storage log alerts:'*)
+                (( kernel_finding_count > 0 )) && line_color=$color_red || line_color=$color_green
+                ;;
+            'Kernel storage log warnings:'*)
+                (( kernel_warning_count > 0 )) && line_color=$color_yellow || line_color=$color_green
+                ;;
+            'Kernel log scan errors:'*)
+                (( kernel_scan_error > 0 )) && line_color=$color_red || line_color=$color_green
+                ;;
+            'Kernel journal coverage:'*)
+                (( kernel_coverage_gap > 0 )) && line_color=$color_yellow || line_color=$color_green
+                ;;
+            'Kernel journal persistence:'*)
+                if (( kernel_persistence_error > 0 )); then
+                    line_color=$color_red
+                elif (( kernel_persistence_changed > 0 )); then
+                    line_color=$color_yellow
+                else
+                    line_color=$color_green
+                fi
+                ;;
+            'Filesystem alerts:'*)
+                (( filesystem_alert_count > 0 )) && line_color=$color_red || line_color=$color_green
+                ;;
+            'Filesystem warnings:'*)
+                (( filesystem_warning_count > 0 )) && line_color=$color_yellow || line_color=$color_green
+                ;;
+            'Filesystem notices:'*)
+                (( filesystem_notice_count > 0 )) && line_color=$color_cyan || line_color=$color_green
+                ;;
+            'SMART failures:'*|'SMART command errors:'*)
+                if (( smart_fail_count + smart_error_count > 0 )); then line_color=$color_red; else line_color=$color_green; fi
+                ;;
+            'SMART warnings:'*|'SMART unsupported devices:'*)
+                if (( smart_warning_count + smart_unsupported_count > 0 )); then line_color=$color_yellow; else line_color=$color_green; fi
+                ;;
+            'Changed package files:'*)
+                (( changed_count > 0 )) && line_color=$color_red || line_color=$color_green
+                ;;
+            'Missing package files:'*)
+                (( missing_count > 0 )) && line_color=$color_red || line_color=$color_green
+                ;;
+            'Expected changed files ignored:'*)
+                (( ignored_changed_count > 0 )) && line_color=$color_green || line_color=''
+                ;;
+            'Packages without checksum data:'*)
+                (( coverage_count > 0 )) && line_color=$color_yellow || line_color=$color_green
+                ;;
+            'Automatic system changes:'*)
+                if (( automatic_warning_count > 0 )); then
+                    line_color=$color_yellow
+                elif (( automatic_notice_count > 0 )); then
+                    line_color=$color_cyan
+                else
+                    line_color=$color_green
+                fi
+                ;;
+            'Automatic change warnings:'*)
+                (( automatic_warning_count > 0 )) && line_color=$color_yellow || line_color=$color_green
+                ;;
+            'Automatic change notices:'*)
+                (( automatic_notice_count > 0 )) && line_color=$color_cyan || line_color=$color_green
+                ;;
+            STATUS*|'---------'*)
+                line_color=$color_bold
+                ;;
+        esac
+
+        printf '%s%s%s\n' "$line_color" "$line" "$color_reset"
+    done < "$report_path"
+}
+
+build_html_report() {
+    local subject=$1
+    local state=$2
+    local line style in_scope_section=0
+    local state_text state_background state_border
+
+    case "$state" in
+        ALERT|ERROR)
+            state_text='#991b1b'; state_background='#fee2e2'; state_border='#dc2626'
+            ;;
+        WARNING)
+            state_text='#92400e'; state_background='#fef3c7'; state_border='#f59e0b'
+            ;;
+        NOTICE)
+            state_text='#075985'; state_background='#e0f2fe'; state_border='#0ea5e9'
+            ;;
+        *)
+            state_text='#166534'; state_background='#dcfce7'; state_border='#22c55e'
+            ;;
+    esac
+
+    {
+        printf '%s\n' '<!DOCTYPE html>'
+        printf '%s\n' '<html lang="en"><head><meta charset="UTF-8">'
+        printf '%s\n' '<meta name="viewport" content="width=device-width, initial-scale=1.0">'
+        printf '<title>%s</title></head>\n' "$(html_escape "$subject")"
+        printf '%s\n' '<body style="margin:0;padding:0;background:#f3f4f6;color:#111827;font-family:Consolas,Monaco,Courier New,monospace;">'
+        printf '%s\n' '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0"><tr><td align="center" style="padding:24px 12px;">'
+        printf '%s\n' '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="max-width:1100px;background:#fff;border:1px solid #d1d5db;border-radius:10px;">'
+        printf '<tr><td style="padding:22px;background:#0f172a;color:#fff;font-size:21px;font-weight:700;">Ubuntu storage and package integrity audit</td></tr>\n'
+        printf '<tr><td style="padding:16px 22px;background:%s;border-left:6px solid %s;color:%s;font-size:17px;font-weight:700;">Audit status: %s</td></tr>\n' \
+            "$state_background" "$state_border" "$state_text" "$(html_escape "$state")"
+        printf '%s\n' '<tr><td style="padding:22px;">'
+        printf '%s\n' '<pre style="margin:0;padding:18px;background:#f8fafc;border:1px solid #cbd5e1;border-radius:6px;color:#111827;font-family:Consolas,Monaco,Courier New,monospace;font-size:13px;line-height:1.45;white-space:pre;overflow-x:auto;">'
+
+        while IFS= read -r line || [[ -n $line ]]; do
+            style='color:#111827;'
+
+            if [[ $line == 'Scope and interpretation' ]]; then
+                in_scope_section=1
+                style='color:#4b5563;font-weight:700;'
+            elif (( in_scope_section )); then
+                style='color:#4b5563;'
+            else
+                case "$line" in
+                    'Ubuntu storage and package integrity audit'|'Audit coverage'|'Summary'|\
+                    'Recent kernel storage alerts'|'Recent kernel storage warnings'|\
+                    'Recent kernel storage scan error'|\
+                    'Filesystem, RAID, and capacity findings'|\
+                    'Filesystem and RAID details'|'SMART device summary'|\
+                    'SMART details'|'Package files that failed verification'|\
+                    'Expected changed package files ignored'|\
+                    'Packages not checked because checksum data is absent'|\
+                    'Raw debsums diagnostics'|'Automatic system changes'|\
+                    'Audit execution notes'|'Resolved since previous audit')
+                        style='color:#0369a1;font-weight:700;'
+                        ;;
+                    ALERT*|KERNEL*|CHANGED*|MISSING*|FAIL*|ERROR*|IMPORTANT:*)
+                        style='color:#991b1b;font-weight:700;'
+                        ;;
+                    WARNING*|UNSUPPORTED*)
+                        style='color:#92400e;font-weight:700;'
+                        ;;
+                    NOTICE*|RESOLVED*)
+                        style='color:#075985;font-weight:700;'
+                        ;;
+                    OK*|IGNORED*)
+                        style='color:#166534;font-weight:700;'
+                        ;;
+                    STATUS*|'---------'*)
+                        style='color:#111827;font-weight:700;'
+                        ;;
+                esac
+            fi
+
+            printf '<span style="%s">%s</span>\n' "$style" "$(html_escape "$line")"
+        done < "$report_file"
+
+        printf '%s\n' '</pre></td></tr>'
+        printf '%s\n' '<tr><td style="padding:14px 22px;background:#f8fafc;color:#64748b;font-size:12px;border-top:1px solid #e5e7eb;">Automated multipart report: plain text plus colorized fixed-width HTML.</td></tr>'
+        printf '%s\n' '</table></td></tr></table></body></html>'
+    } > "$html_report_file"
+}
+
+trap on_exit EXIT
+
+if (( EUID != 0 )); then
+    printf '%s must be run as root.\n' "$PROGRAM_NAME" >&2
+    exit 1
+fi
+
+# The RPM backend is not yet implemented. Fail clearly before any audit or
+# package management is attempted on unsupported distributions.
+if [[ ! -r $OS_RELEASE_FILE ]]; then
+    printf '%s: cannot identify OS from %s.\n' "$PROGRAM_NAME" "$OS_RELEASE_FILE" >&2
+    exit 78
+fi
+# shellcheck disable=SC1090
+. "$OS_RELEASE_FILE"
+case "${ID:-}" in
+    ubuntu|debian) ;;
+    rocky|rhel|almalinux|centos)
+        printf '%s: RPM package-integrity backend is not implemented in this development preview.\n' "$PROGRAM_NAME" >&2
+        exit 78
+        ;;
+    *)
+        printf '%s: unsupported distribution ID: %s.\n' "$PROGRAM_NAME" "${ID:-unknown}" >&2
+        exit 78
+        ;;
+esac
+
+if ! is_nonnegative_integer "$APT_LOCK_WAIT_SECONDS" || \
+   ! is_nonnegative_integer "$APT_LOCK_RETRY_COUNT" || \
+   ! is_nonnegative_integer "$MEGARAID_MAX_INDEX" || \
+   ! is_nonnegative_integer "$SCRUB_MAX_AGE_DAYS"; then
+    printf '%s: APT lock settings, MEGARAID_MAX_INDEX, and SCRUB_MAX_AGE_DAYS must be nonnegative integers.\n' \
+        "$PROGRAM_NAME" >&2
+    exit 64
+fi
+
+for percentage_value in \
+    "$SPACE_NOTICE_PERCENT" "$SPACE_WARNING_PERCENT" "$SPACE_ALERT_PERCENT" \
+    "$INODE_NOTICE_PERCENT" "$INODE_WARNING_PERCENT" "$INODE_ALERT_PERCENT" \
+    "$LVM_THIN_NOTICE_PERCENT" "$LVM_THIN_WARNING_PERCENT" "$LVM_THIN_ALERT_PERCENT"; do
+    if ! is_percentage_integer "$percentage_value"; then
+        printf '%s: all filesystem usage thresholds must be integers from 0 through 100.\n' \
+            "$PROGRAM_NAME" >&2
+        exit 64
+    fi
+done
+
+if ! (( SPACE_NOTICE_PERCENT < SPACE_WARNING_PERCENT && \
+        SPACE_WARNING_PERCENT < SPACE_ALERT_PERCENT && \
+        INODE_NOTICE_PERCENT < INODE_WARNING_PERCENT && \
+        INODE_WARNING_PERCENT < INODE_ALERT_PERCENT && \
+        LVM_THIN_NOTICE_PERCENT < LVM_THIN_WARNING_PERCENT && \
+        LVM_THIN_WARNING_PERCENT < LVM_THIN_ALERT_PERCENT )); then
+    printf '%s: NOTICE thresholds must be lower than WARNING, and WARNING lower than ALERT.\n' \
+        "$PROGRAM_NAME" >&2
+    exit 64
+fi
+
+for timeout_value in "$SMART_TIMEOUT_SECONDS" "$PROBE_TIMEOUT_SECONDS" \
+    "$JOURNAL_TIMEOUT_SECONDS" "$APT_COMMAND_TIMEOUT_SECONDS" \
+    "$DEBSUMS_TIMEOUT_SECONDS" "$ATA_CORRELATION_SECONDS" \
+    "$NOTIFICATION_REPEAT_DAYS" "$MEGARAID_SCAN_BUDGET_SECONDS"; do
+    if ! is_nonnegative_integer "$timeout_value" || (( timeout_value < 1 )); then
+        printf '%s: timeouts, ATA correlation and notification repeat days must be positive integers.\n' "$PROGRAM_NAME" >&2
+        exit 64
+    fi
+done
+
+if (( MEGARAID_MAX_INDEX > 255 )); then
+    printf '%s: MEGARAID_MAX_INDEX must not exceed 255.\n' \
+        "$PROGRAM_NAME" >&2
+    exit 64
+fi
+
+core_commands=(
+    cat date dirname dpkg-query flock grep head hostname logger lslocks mkdir mktemp
+    paste rm sed sleep sort uname wc timeout sha256sum mv chmod cp
+)
+# Email delivery is opt-in. Do not require an MTA for terminal-only use.
+if email_reporting_enabled; then
+    core_commands+=(sendmail)
+fi
+
+if is_enabled "$KERNEL_LOG_CHECK_ENABLED"; then
+    core_commands+=(journalctl systemd-analyze)
+    if is_enabled "$AUTO_ENABLE_PERSISTENT_JOURNAL"; then
+        core_commands+=(install systemctl systemd-tmpfiles)
+    fi
+fi
+
+if is_enabled "$SMART_CHECK_ENABLED"; then
+    core_commands+=(findmnt lsblk)
+fi
+
+if is_enabled "$FILESYSTEM_CHECKS_ENABLED"; then
+    core_commands+=(df findmnt journalctl lsblk systemctl)
+fi
+
+failure_context='checking essential commands'
+require_commands "${core_commands[@]}" || exit $?
+
+failure_context='creating the singleton lock directory'
+mkdir -p -- "$(dirname "$LOCK_FILE")" || {
+    printf '%s: unable to create lock directory for %s.\n' "$PROGRAM_NAME" "$LOCK_FILE" >&2
+    exit 1
+}
+
+exec 9>"$LOCK_FILE" || {
+    printf '%s: unable to open lock file: %s\n' "$PROGRAM_NAME" "$LOCK_FILE" >&2
+    exit 1
+}
+
+# A prior run is still active; do not start a duplicate.
+flock -n 9 || exit 0
+
+progress_spinner_pid=''
+progress_label=''
+print_startup_banner
+
+work_dir=$(mktemp -d -t system-integrity-audit.XXXXXXXX) || exit 1
+trap handle_interrupt INT
+trap 'suppress_exit_report=1; exit 129' HUP
+trap 'suppress_exit_report=1; exit 143' TERM
+
+apt_output_file="$work_dir/apt-output.txt"
+kernel_raw_file="$work_dir/kernel-raw.txt"
+kernel_matches_raw_file="$work_dir/kernel-matches-raw.txt"
+kernel_findings_file="$work_dir/kernel-findings.txt"
+kernel_warnings_file="$work_dir/kernel-warnings.txt"
+kernel_scan_error_file="$work_dir/kernel-scan-error.txt"
+kernel_export_file="$work_dir/kernel-export.txt"
+kernel_events_file="$work_dir/kernel-events.tsv"
+smart_summary_file="$work_dir/smart-summary.tsv"
+smart_details_file="$work_dir/smart-details.txt"
+changed_file="$work_dir/changed-files.txt"
+diagnostics_file="$work_dir/debsums-diagnostics.txt"
+diagnostics_safe_file="$work_dir/debsums-diagnostics-safe.txt"
+coverage_file="$work_dir/packages-without-checksums.txt"
+coverage_safe_file="$work_dir/packages-without-checksums-safe.txt"
+findings_file="$work_dir/package-findings.tsv"
+ignored_findings_file="$work_dir/ignored-package-findings.tsv"
+report_file="$work_dir/report.txt"
+html_report_file="$work_dir/report.html"
+execution_notes_file="$work_dir/execution-notes.txt"
+automatic_changes_file="$work_dir/automatic-system-changes.txt"
+filesystem_findings_file="$work_dir/filesystem-findings.tsv"
+filesystem_details_file="$work_dir/filesystem-details.txt"
+local_filesystems_file="$work_dir/local-filesystems.tsv"
+findings_events_file="$work_dir/findings-events.tsv"
+notification_next_state_file="$work_dir/next-state.tsv"
+resolved_findings_file="$work_dir/resolved-findings.tsv"
+
+
+: > "$execution_notes_file"
+: > "$automatic_changes_file"
+automatic_change_count=0
+automatic_warning_count=0
+automatic_notice_count=0
+
+failure_context='loading exception rules'
+progress_start 'Loading exception rules'
+load_exception_patterns
+exception_status=$?
+if (( exception_status != 0 )); then
+    progress_finish failed
+    exit "$exception_status"
+fi
+progress_finish done
+
+failure_context='installing audit prerequisites'
+progress_start 'Checking and installing audit prerequisites'
+install_missing_audit_tools
+install_status=$?
+if (( install_status != 0 )); then
+    progress_finish failed
+    exit "$install_status"
+elif (( automatic_notice_count > 0 )); then
+    progress_finish notice
+else
+    progress_finish done
+fi
+
+failure_context='verifying audit commands'
+progress_start 'Verifying audit commands'
+require_commands debsums
+command_status=$?
+if (( command_status == 0 )) && is_enabled "$SMART_CHECK_ENABLED"; then
+    require_commands smartctl
+    command_status=$?
+fi
+if (( command_status != 0 )); then
+    progress_finish failed
+    exit "$command_status"
+fi
+progress_finish done
+
+kernel_scan_error=0
+kernel_coverage_gap=0
+kernel_coverage_unknown=0
+kernel_coverage_summary='unknown'
+kernel_persistence_changed=0
+kernel_persistence_error=0
+kernel_persistence_summary='unknown'
+kernel_finding_count=0
+kernel_warning_count=0
+smart_device_count=0
+smart_ok_count=0
+smart_warning_count=0
+smart_fail_count=0
+smart_error_count=0
+smart_unsupported_count=0
+debsums_status=0
+coverage_status=0
+changed_count=0
+missing_count=0
+ignored_changed_count=0
+coverage_count=0
+mismatch_found=0
+execution_error=0
+coverage_alert=0
+final_exit_status=0
+filesystem_mount_count=0
+filesystem_unique_count=0
+filesystem_alert_count=0
+filesystem_warning_count=0
+filesystem_notice_count=0
+filesystem_ok_count=0
+filesystem_check_error_count=0
+readonly_mount_count=0
+capacity_finding_count=0
+inode_not_applicable_count=0
+fsck_unit_count=0
+fsck_finding_count=0
+md_array_count=0
+btrfs_filesystem_count=0
+zfs_pool_count=0
+lvm_volume_count=0
+deep_check_target_count=0
+
+if is_enabled "$KERNEL_LOG_CHECK_ENABLED"; then
+    progress_start 'Checking persistent kernel journal storage'
+    ensure_persistent_journal_storage
+    kernel_persistence_status=$?
+    if (( kernel_persistence_status != 0 )); then
+        progress_finish failed
+        execution_error=1
+        (( final_exit_status == 0 )) && final_exit_status=$kernel_persistence_status
+        printf 'Persistent kernel journal storage could not be enabled or verified.\n' \
+            >> "$execution_notes_file"
+    elif (( kernel_persistence_changed > 0 )); then
+        progress_finish warning
+    else
+        progress_finish done
+    fi
+
+    progress_start 'Scanning recent kernel storage messages'
+    scan_kernel_storage_logs
+    kernel_finding_count=$(grep -c '.' "$kernel_findings_file" || true)
+    kernel_warning_count=$(grep -c '.' "$kernel_warnings_file" || true)
+    if (( kernel_scan_error > 0 )); then
+        progress_finish failed
+        execution_error=1
+        final_exit_status=1
+        printf 'Kernel log scan failed; storage-log verification is incomplete.\n' \
+            >> "$execution_notes_file"
+    elif (( kernel_finding_count > 0 )); then
+        progress_finish failed
+    elif (( kernel_warning_count > 0 )); then
+        progress_finish warning
+    else
+        progress_finish done
+    fi
+
+    progress_start 'Checking kernel journal coverage'
+    check_kernel_log_coverage
+    if (( kernel_coverage_gap + kernel_coverage_unknown > 0 )); then
+        progress_finish warning
+    else
+        progress_finish done
+    fi
+else
+    progress_skip 'Kernel journal and storage-log checks disabled'
+fi
+
+if is_enabled "$FILESYSTEM_CHECKS_ENABLED"; then
+    progress_start 'Checking filesystems, capacity, RAID, LVM, and scrub status'
+    run_filesystem_checks
+    if (( filesystem_alert_count > 0 )); then
+        progress_finish failed
+    elif (( filesystem_warning_count + filesystem_check_error_count > 0 )); then
+        progress_finish warning
+    elif (( filesystem_notice_count > 0 )); then
+        progress_finish notice
+    else
+        progress_finish done
+    fi
+else
+    progress_skip 'Filesystem, RAID, and capacity checks disabled'
+fi
+
+if is_enabled "$SMART_CHECK_ENABLED"; then
+    progress_start 'Checking SMART health for physical disks'
+    run_smart_checks
+    if (( smart_error_count > 0 )); then
+        progress_finish failed
+        execution_error=1
+        final_exit_status=1
+        printf 'One or more SMART commands failed; disk-health verification is incomplete.\n' \
+            >> "$execution_notes_file"
+    elif (( smart_fail_count > 0 )); then
+        progress_finish failed
+    elif (( smart_warning_count + smart_unsupported_count > 0 )); then
+        progress_finish warning
+    else
+        progress_finish done
+    fi
+else
+    progress_skip 'SMART checks disabled'
+fi
+
+failure_context='verifying package-managed files'
+progress_start 'Verifying package-managed files with debsums'
+run_debsums_consistently
+debsums_run_status=$?
+if (( debsums_run_status != 0 )); then
+    progress_finish failed
+    execution_error=1
+    final_exit_status=$debsums_run_status
+    : > "$changed_file"
+    : > "$diagnostics_file"
+    : > "$coverage_file"
+    printf 'debsums was not run because package management did not become idle.\n' \
+        >> "$execution_notes_file"
+elif (( debsums_status == 2 || debsums_status == 3 || coverage_status != 0 )); then
+    progress_finish warning
+else
+    progress_finish done
+fi
+
+progress_start 'Classifying package verification results' 
+build_package_findings
+if (( changed_count + missing_count > 0 )); then
+    progress_finish failed
+elif (( ignored_changed_count > 0 || coverage_count > 0 )); then
+    progress_finish notice
+else
+    progress_finish done
+fi
+
+case "$debsums_status" in
+    0)
+        if (( changed_count + missing_count > 0 )); then
+            execution_error=1
+            (( final_exit_status == 0 )) && final_exit_status=1
+            printf 'debsums returned success but parsed verification findings were present.\n' \
+                >> "$execution_notes_file"
+        fi
+        ;;
+    2)
+        if (( changed_count + missing_count > 0 )); then
+            mismatch_found=1
+        elif (( ignored_changed_count == 0 )); then
+            execution_error=1
+            (( final_exit_status == 0 )) && final_exit_status=1
+            printf 'debsums reported mismatches, but no recognized findings were parsed.\n' \
+                >> "$execution_notes_file"
+        fi
+        ;;
+    3)
+        (( changed_count + missing_count > 0 )) && mismatch_found=1
+        execution_error=1
+        (( final_exit_status == 0 )) && final_exit_status=1
+        ;;
+    *)
+        if (( debsums_run_status == 0 )); then
+            execution_error=1
+            (( final_exit_status == 0 )) && final_exit_status=1
+            printf 'debsums exited with an unexpected status (%s); verification may be incomplete.\n' \
+                "$debsums_status" >> "$execution_notes_file"
+        fi
+        # Regardless of why debsums exited unusually, real parsed findings
+        # must still classify as ALERT rather than being masked by ERROR.
+        (( changed_count + missing_count > 0 )) && mismatch_found=1
+        ;;
+esac
+
+if (( coverage_status != 0 && debsums_run_status == 0 )); then
+    execution_error=1
+    (( final_exit_status == 0 )) && final_exit_status=1
+fi
+
+if is_enabled "$REPORT_COVERAGE_GAPS" && (( coverage_count > 0 )); then
+    coverage_alert=1
+fi
+
+# Single source of truth for the report status and notification policy.
+assemble_finding_ledger
+prepare_notifications
+report_needed=0
+if (( notification_due > 0 )) || is_enabled "$FORCE_REPORT"; then
+    report_needed=1
+fi
+if (( report_needed == 0 )); then
+    if ! save_notification_state 0; then
+        printf '%s: unable to persist notification state; future runs may repeat findings.\n' \
+            "$PROGRAM_NAME" >&2
+        exit 1
+    fi
+    if progress_output_enabled; then
+        printf 'Audit complete: no new or due findings.\n' >&2
+    fi
+    exit "$final_exit_status"
+fi
+
+progress_start 'Building audit report'
+
+system_name=$(hostname -f 2>/dev/null || hostname)
+short_name=$(hostname -s 2>/dev/null || hostname)
+os_name='Unknown Ubuntu/Debian release'
+if [[ -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    os_name=${PRETTY_NAME:-${NAME:-$os_name}}
+fi
+machine_id='Unavailable'
+if [[ -r /etc/machine-id ]]; then
+    machine_id=$(cat /etc/machine-id)
+fi
+
+if (( event_alert_count > 0 )); then
+    subject_state='ALERT'
+elif (( event_error_count > 0 )); then
+    subject_state='ERROR'
+elif (( event_warning_count > 0 )); then
+    subject_state='WARNING'
+elif (( event_notice_count > 0 || notification_resolved_count > 0 )); then
+    subject_state='NOTICE'
+else
+    subject_state='TEST/OK'
+fi
+
+subject="$SUBJECT_PREFIX $subject_state - $system_name"
+
+change_severity=''
+change_message=''
+
+{
+    printf 'Debian/Ubuntu storage and package integrity audit (2.0 development preview)\n'
+    printf '==========================================\n\n'
+    printf 'Script version:                 %s\n' "$PROGRAM_VERSION"
+    printf 'System name:                    %s\n' "$(sanitize_text "$system_name")"
+    printf 'Short hostname:                 %s\n' "$(sanitize_text "$short_name")"
+    printf 'Machine ID:                     %s\n' "$(sanitize_text "$machine_id")"
+    printf 'Operating system:               %s\n' "$(sanitize_text "$os_name")"
+    printf 'Kernel:                         %s\n' "$(sanitize_text "$(uname -srmo)")"
+    printf 'Report time:                    %s\n' "$(date --iso-8601=seconds)"
+    printf 'Kernel log lookback:            %s\n' "$(sanitize_text "$KERNEL_LOG_SINCE")"
+    printf 'Exceptions file:                %s\n' "$(sanitize_text "$EXCEPTIONS_FILE")"
+    printf 'Exception patterns loaded:      %s\n' "$exception_pattern_count"
+    printf 'debsums exit code:              %s\n' "$debsums_status"
+    printf '\n'
+
+    printf 'Audit coverage\n'
+    printf -- '--------------\n'
+    if is_enabled "$KERNEL_LOG_CHECK_ENABLED"; then
+        if (( kernel_scan_error > 0 )); then
+            printf 'Kernel event review:            INCOMPLETE (journal query failed)\n'
+        elif (( kernel_coverage_unknown > 0 )); then
+            printf 'Kernel event review:            INCOMPLETE (retention unknown)\n'
+        elif (( kernel_coverage_gap > 0 )); then
+            printf 'Kernel event review:            PARTIAL (shorter than requested lookback)\n'
+        else
+            printf 'Kernel event review:            COMPLETED (retained journal)\n'
+        fi
+    else
+        printf 'Kernel event review:            DISABLED\n'
+    fi
+    if is_enabled "$FILESYSTEM_CHECKS_ENABLED"; then
+        if (( filesystem_check_error_count > 0 )); then
+            printf 'Filesystem/RAID review:         INCOMPLETE (%s command checks failed)\n' \
+                "$filesystem_check_error_count"
+        else
+            printf 'Filesystem/RAID review:         COMPLETED (where supported)\n'
+        fi
+    else
+        printf 'Filesystem/RAID review:         DISABLED\n'
+    fi
+    if is_enabled "$SMART_CHECK_ENABLED"; then
+        if (( smart_error_count + smart_unsupported_count > 0 )); then
+            printf 'SMART physical disk review:     PARTIAL (%s command failures, %s unsupported)\n' \
+                "$smart_error_count" "$smart_unsupported_count"
+        else
+            printf 'SMART physical disk review:     COMPLETED (%s physical devices)\n' "$smart_device_count"
+        fi
+    else
+        printf 'SMART physical disk review:     DISABLED\n'
+    fi
+    if (( debsums_run_status > 0 || coverage_status > 0 )); then
+        printf 'Package-file verification:      INCOMPLETE\n'
+    else
+        printf 'Package-file verification:      COMPLETED (checksum-covered files only)\n'
+    fi
+    printf '\n'
+
+    printf 'Summary\n'
+    printf -- '-------\n'
+    printf 'Kernel storage log alerts:      %s\n' "$kernel_finding_count"
+    printf 'Kernel storage log warnings:    %s\n' "$kernel_warning_count"
+    printf 'Kernel log scan errors:         %s\n' "$kernel_scan_error"
+    printf 'Kernel journal coverage:        %s\n' "$kernel_coverage_summary"
+    printf 'Kernel journal persistence:     %s\n' "$kernel_persistence_summary"
+    printf 'Local mounts evaluated:         %s\n' "$filesystem_mount_count"
+    printf 'Unique filesystems evaluated:   %s\n' "$filesystem_unique_count"
+    printf 'Filesystem alerts:              %s\n' "$filesystem_alert_count"
+    printf 'Filesystem warnings:            %s\n' "$filesystem_warning_count"
+    printf 'Filesystem notices:             %s\n' "$filesystem_notice_count"
+    printf 'Filesystem check errors:        %s\n' "$filesystem_check_error_count"
+    printf 'Unexpected read-only mounts:    %s\n' "$readonly_mount_count"
+    printf 'Space/inode findings:           %s\n' "$capacity_finding_count"
+    printf 'Inode checks not applicable:    %s\n' "$inode_not_applicable_count"
+    printf 'Boot fsck services checked:     %s\n' "$fsck_unit_count"
+    printf 'Boot fsck findings:             %s\n' "$fsck_finding_count"
+    printf 'Linux MD arrays checked:        %s\n' "$md_array_count"
+    printf 'Btrfs filesystems checked:      %s\n' "$btrfs_filesystem_count"
+    printf 'ZFS pools checked:              %s\n' "$zfs_pool_count"
+    printf 'LVM volumes checked:            %s\n' "$lvm_volume_count"
+    printf 'Deep-check targets reviewed:    %s\n' "$deep_check_target_count"
+    printf 'SMART devices checked:          %s\n' "$smart_device_count"
+    printf 'SMART healthy devices:          %s\n' "$smart_ok_count"
+    printf 'SMART warnings:                 %s\n' "$smart_warning_count"
+    printf 'SMART failures:                 %s\n' "$smart_fail_count"
+    printf 'SMART command errors:           %s\n' "$smart_error_count"
+    printf 'SMART unsupported devices:      %s\n' "$smart_unsupported_count"
+    printf 'Changed package files:          %s\n' "$changed_count"
+    printf 'Missing package files:          %s\n' "$missing_count"
+    printf 'Expected changed files ignored: %s\n' "$ignored_changed_count"
+    printf 'Packages without checksum data: %s\n' "$coverage_count"
+    printf 'Automatic system changes:       %s\n' "$automatic_change_count"
+    printf 'Automatic change warnings:      %s\n' "$automatic_warning_count"
+    printf 'Automatic change notices:       %s\n' "$automatic_notice_count"
+    printf 'Notification findings new:      %s\n' "$notification_new_count"
+    printf 'Notification findings ongoing:  %s\n' "$notification_ongoing_count"
+    printf 'Notification findings resolved: %s\n' "$notification_resolved_count"
+    printf '\n'
+
+    if (( kernel_finding_count > 0 )); then
+        printf 'Recent kernel storage alerts\n'
+        printf -- '----------------------------\n'
+        while IFS= read -r line || [[ -n $line ]]; do
+            printf 'KERNEL    %s\n' "$line"
+        done < "$kernel_findings_file"
+        printf '\n'
+    fi
+
+    if (( kernel_warning_count > 0 )); then
+        printf 'Recent kernel storage warnings\n'
+        printf -- '------------------------------\n'
+        while IFS= read -r line || [[ -n $line ]]; do
+            printf 'WARNING   %s\n' "$line"
+        done < "$kernel_warnings_file"
+        printf '\n'
+    fi
+
+    if (( kernel_scan_error > 0 )); then
+        printf 'Recent kernel storage scan error\n'
+        printf -- '--------------------------------\n'
+        printf 'ERROR     Unable to read the kernel journal for the requested period.\n'
+        while IFS= read -r line || [[ -n $line ]]; do
+            printf 'ERROR     %s\n' "$(sanitize_text "$line")"
+        done < "$kernel_scan_error_file"
+        printf '\n'
+    fi
+
+    if [[ -s $filesystem_findings_file ]]; then
+        printf 'Filesystem, RAID, and capacity findings\n'
+        printf -- '---------------------------------------\n'
+        printf '%-9s %-15s %-28s %s\n' 'STATUS' 'CATEGORY' 'RESOURCE' 'DETAIL'
+        printf '%-9s %-15s %-28s %s\n' '---------' '---------------' '----------------------------' '------'
+        while IFS=$'\t' read -r severity category resource detail; do
+            [[ -n ${severity:-} ]] || continue
+            printf '%-9s %-15s %-28s %s\n' \
+                "$severity" "$category" "$resource" "$detail"
+        done < "$filesystem_findings_file"
+        printf '\n'
+    fi
+
+    if [[ -s $filesystem_details_file ]]; then
+        printf 'Filesystem and RAID details\n'
+        printf -- '---------------------------\n'
+        cat "$filesystem_details_file"
+    fi
+
+    if [[ -s $smart_summary_file ]] && \
+       { is_enabled "$FORCE_REPORT" || (( smart_warning_count + smart_fail_count + smart_error_count + smart_unsupported_count > 0 )); }; then
+        printf 'SMART device summary\n'
+        printf -- '--------------------\n'
+        printf '%-12s %-20s %-28s %s\n' 'STATUS' 'DEVICE' 'MODEL' 'HEALTH/DETAIL'
+        printf '%-12s %-20s %-28s %s\n' '------------' '--------------------' '----------------------------' '-------------'
+        while IFS=$'\t' read -r status device model health; do
+            printf '%-12s %-20s %-28s %s\n' "$status" "$device" "$model" "$health"
+        done < "$smart_summary_file"
+        printf '\n'
+    fi
+
+    if [[ -s $smart_details_file ]]; then
+        printf 'SMART details\n'
+        printf -- '-------------\n'
+        cat "$smart_details_file"
+    fi
+
+    if [[ -s $findings_file ]]; then
+        printf 'Package files that failed verification\n'
+        printf -- '--------------------------------------\n'
+        printf '%-9s %-40s %s\n' 'STATUS' 'PACKAGE(S)' 'FILE'
+        printf '%-9s %-40s %s\n' '---------' '----------------------------------------' '----'
+        while IFS=$'\t' read -r status package_name file_path; do
+            printf '%-9s %-40s %s\n' "$status" "$package_name" "$file_path"
+        done < "$findings_file"
+        printf '\n'
+    fi
+
+    if [[ -s $ignored_findings_file ]]; then
+        printf 'Expected changed package files ignored\n'
+        printf -- '--------------------------------------\n'
+        printf '%-9s %-40s %s\n' 'STATUS' 'PACKAGE(S)' 'FILE'
+        printf '%-9s %-40s %s\n' '---------' '----------------------------------------' '----'
+        while IFS=$'\t' read -r status package_name file_path; do
+            printf '%-9s %-40s %s\n' "$status" "$package_name" "$file_path"
+        done < "$ignored_findings_file"
+        printf '\n'
+    fi
+
+    if [[ -s $coverage_safe_file ]]; then
+        printf 'Packages not checked because checksum data is absent\n'
+        printf -- '----------------------------------------------------\n'
+        cat "$coverage_safe_file"
+        printf '\n'
+        printf 'Run debsums_init as root to create missing checksum manifests where\n'
+        printf 'matching package archives are available.\n\n'
+    fi
+
+    if [[ -s $diagnostics_safe_file ]]; then
+        printf 'Raw debsums diagnostics\n'
+        printf -- '------------------------\n'
+        cat "$diagnostics_safe_file"
+        printf '\n'
+    fi
+
+    if [[ -s $automatic_changes_file ]]; then
+        printf 'Automatic system changes\n'
+        printf -- '------------------------\n'
+        while IFS=$'\t' read -r change_severity change_message || \
+              [[ -n ${change_severity:-}${change_message:-} ]]; do
+            [[ -n ${change_severity:-} ]] || continue
+            printf '%-9s %s\n' \
+                "$(sanitize_text "$change_severity")" \
+                "$(sanitize_text "${change_message:-}")"
+        done < "$automatic_changes_file"
+        printf '\n'
+    fi
+
+    if [[ -s $execution_notes_file ]]; then
+        printf 'Audit execution notes\n'
+        printf -- '---------------------\n'
+        while IFS= read -r line || [[ -n $line ]]; do
+            printf 'IMPORTANT: %s\n' "$(sanitize_text "$line")"
+        done < "$execution_notes_file"
+        printf '\n'
+    fi
+
+    if [[ -s $resolved_findings_file ]]; then
+        printf 'Resolved since previous audit\n'
+        printf -- '-----------------------------\n'
+        while IFS=$'\t' read -r severity category resource; do
+            [[ -n $severity ]] || continue
+            printf 'RESOLVED  %-9s %-18s %s\n' "$severity" "$category" "$resource"
+        done < "$resolved_findings_file"
+        printf '\n'
+    fi
+
+    printf 'Scope and interpretation\n'
+    printf -- '------------------------\n'
+    printf 'This section is general coverage information; it does not indicate that\n'
+    printf 'a storage problem was detected. Any detected storage issue is listed\n'
+    printf 'explicitly in the kernel-log, filesystem/RAID, or SMART sections above.\n'
+    printf 'The audit checks mount state, capacity, boot fsck results, selected RAID and\n'
+    printf 'filesystem-native health data, and recorded scrub status. It does not run\n'
+    printf 'fsck, repair filesystems, or start deep scrubs. No online health check can\n'
+    printf 'guarantee every disk, cable, controller, RAID, virtual-storage, or\n'
+    printf 'filesystem condition. debsums checks package-managed\n'
+    printf 'file contents that have checksum data; expected CHANGED paths may be\n'
+    printf 'suppressed by the exceptions file, but MISSING files are never suppressed.\n'
+    printf 'debsums does not verify arbitrary local data, permissions, ownership, ACLs,\n'
+    printf 'or all filesystem metadata. Filenames containing embedded newlines remain\n'
+    printf 'limited by debsums line-oriented output.\n'
+} > "$report_file"
+
+build_html_report "$subject" "$subject_state"
+progress_finish done
+print_terminal_report "$report_file" "$subject_state"
+
+# The default placeholder or empty recipient means no outgoing mail.
+# Crucially, do not mark notifications as delivered in the state file.
+if ! email_reporting_enabled; then
+    if ! save_notification_state 0; then
+        printf '%s: unable to persist notification state.\n' "$PROGRAM_NAME" >&2
+        exit 1
+    fi
+    if progress_output_enabled; then
+        printf 'Email disabled (REPORT_TO is a placeholder or empty); report was not mailed.\n' >&2
+    fi
+    exit "$final_exit_status"
+fi
+
+failure_context='sending email report'
+progress_start 'Sending email report' 
+if ! send_report "$subject" "$report_file" "$html_report_file"; then
+    progress_finish failed
+    exit 1
+fi
+progress_finish done
+
+if ! save_notification_state 1; then
+    printf '%s: email sent, but notification state could not be saved.\n' \
+        "$PROGRAM_NAME" >&2
+    exit 1
+fi
+
+logger -p user.notice -t "$PROGRAM_NAME" \
+    "Sent $subject_state report for $system_name to $REPORT_TO"
+
+exit "$final_exit_status"
