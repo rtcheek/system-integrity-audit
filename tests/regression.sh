@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Non-destructive regression fixtures for system-integrity-audit 2.0.0-dev.3.
+# Non-destructive regression fixtures for system-integrity-audit 2.0.0-dev.4.
 # Run: bash tests/regression.sh [path/to/system-integrity-audit]
 set -euo pipefail
 SCRIPT=${1:-"$(dirname "$0")/../system-integrity-audit"}
@@ -252,8 +252,8 @@ assert_eq "$filesystem_alert_count" 1 'unloaded fsck failure alert'
 pass 'loaded clean + unloaded failing fsck journal coverage'
 
 # Kernel journal retention: systemd 255+ can seek to the oldest matching
-# event directly. systemd 249 (Ubuntu 22.04) must stream just the first
-# matching entry without exporting the entire retained kernel history.
+# event directly. systemd 249 (Ubuntu 22.04) and 245 (Ubuntu 20.04)
+# must stream only the first entry, without exporting full history.
 KERNEL_LOG_SINCE='7 days ago'
 kernel_scan_error=0
 : > "$execution_notes_file"
@@ -280,6 +280,40 @@ if grep -Fq 'WRONG: full history was exported' "$test_dir/coverage-commands"; th
     fail 'legacy fallback did not stop after one entry'
 fi
 pass 'Ubuntu 22.04 bounded first-entry stream'
+
+# Focal's systemd 245 uses the same bounded stream. A direct +N request
+# would fail on this release; the full-journal export must never occur.
+: > "$test_dir/coverage-commands"
+MOCK_SYSTEMD_VERSION=245 MOCK_COVERAGE_MODE=normal
+export MOCK_SYSTEMD_VERSION MOCK_COVERAGE_MODE
+check_kernel_log_coverage
+assert_eq "$kernel_coverage_gap" 0 'systemd 245 coverage complete'
+assert_eq "$kernel_coverage_unknown" 0 'systemd 245 coverage available'
+if grep -Fq -- '--lines=+1' "$test_dir/coverage-commands"; then
+    fail 'systemd 245 used unsupported --lines=+1'
+fi
+if grep -Fq 'WRONG: full history was exported' "$test_dir/coverage-commands"; then
+    fail 'systemd 245 fallback exported full history'
+fi
+pass 'Ubuntu 20.04 systemd 245 bounded kernel journal coverage'
+
+# systemd-analyze cat-config is present in Ubuntu 20.04. Verify both
+# persistent and volatile settings are interpreted without writing config.
+cat > "$test_dir/bin/systemd-analyze" <<'FOCAL_ANALYZE'
+#!/usr/bin/env bash
+[[ ${1:-} == cat-config && ${2:-} == systemd/journald.conf ]] || exit 2
+printf '# /etc/systemd/journald.conf\n[Journal]\nStorage=%s\n' "${MOCK_JOURNAL_STORAGE_MODE:-auto}"
+FOCAL_ANALYZE
+chmod +x "$test_dir/bin/systemd-analyze"
+MOCK_JOURNAL_STORAGE_MODE=persistent
+export MOCK_JOURNAL_STORAGE_MODE
+assert_eq "$(effective_journal_storage_mode)" 'persistent' 'systemd 245 persistent journald config'
+MOCK_JOURNAL_STORAGE_MODE=volatile
+export MOCK_JOURNAL_STORAGE_MODE
+assert_eq "$(effective_journal_storage_mode)" 'volatile' 'systemd 245 volatile journald config'
+MOCK_JOURNAL_STORAGE_MODE=auto
+export MOCK_JOURNAL_STORAGE_MODE
+pass 'Ubuntu 20.04 journald cat-config compatibility'
 
 MOCK_SYSTEMD_VERSION=255 MOCK_COVERAGE_MODE=error
 export MOCK_SYSTEMD_VERSION MOCK_COVERAGE_MODE
@@ -318,7 +352,7 @@ MOCK_COVERAGE_MODE=normal
 export JOURNAL_TIMEOUT_SECONDS MOCK_COVERAGE_MODE
 pass 'coverage failures, empty history, short retention, and timeout handled safely'
 
-assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.3' 'embedded version'
+assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.4' 'embedded version'
 bash -n "$SCRIPT"
 pass 'version and Bash syntax'
 
@@ -368,9 +402,44 @@ assert_eq "$rc" 0 'full clean report exit success'
 grep -q 'Subject: .* TEST/OK - ' "$test_dir/last-email.eml" || fail 'clean status subject'
 grep -q '^From: "System Integrity Audit" <system-integrity-audit>' "$test_dir/last-email.eml" || fail 'visible From header'
 grep -q 'Audit coverage' "$test_dir/last-email.eml" || fail 'coverage section missing'
-grep -q 'Script version: *2.0.0-dev.3' "$test_dir/last-email.eml" || fail 'version absent in report'
+grep -q 'Script version: *2.0.0-dev.4' "$test_dir/last-email.eml" || fail 'version absent in report'
 [[ -f $test_dir/integration-state.tsv ]] || fail 'state file not persisted'
 pass 'full clean report, MIME sender, coverage, state persistence'
+
+# End-to-end Focal OS fixture: package verification plus kernel scan and
+# bounded coverage under systemd 245. No package installation, journald
+# changes, or email are allowed in this mode.
+printf 'ID=ubuntu\nVERSION_ID="20.04"\nPRETTY_NAME="Ubuntu 20.04.6 LTS (fixture)"\n' \
+    > "$test_dir/ubuntu20-os-release"
+: > "$test_dir/journal/raw"
+: > "$test_dir/journal/export"
+rm -f "$test_dir/last-email.eml"
+MOCK_SYSTEMD_VERSION=245 MOCK_COVERAGE_MODE=normal MOCK_JOURNAL_STORAGE_MODE=auto
+export MOCK_SYSTEMD_VERSION MOCK_COVERAGE_MODE MOCK_JOURNAL_STORAGE_MODE
+env "${ENV_ARGS[@]}" \
+    "OS_RELEASE_FILE=$test_dir/ubuntu20-os-release" \
+    "REPORT_TO=username@email.address" "KERNEL_LOG_CHECK_ENABLED=1" \
+    "TERMINAL_OUTPUT=always" \
+    "AUTO_INSTALL_REQUIREMENTS=0" "AUTO_ENABLE_PERSISTENT_JOURNAL=0" \
+    "NOTIFICATION_STATE_FILE=$test_dir/focal-state.tsv" \
+    bash "$test_dir/integration.sh" > "$test_dir/focal-stdout" 2> "$test_dir/focal-stderr"
+rc=$?
+assert_eq "$rc" 0 'Focal full audit returned successful status'
+grep -q 'Ubuntu 20.04.6 LTS (fixture)' "$test_dir/focal-stdout" || fail 'Focal OS missing from report'
+grep -q 'Package-file verification: *COMPLETED' "$test_dir/focal-stdout" || fail 'Focal package audit incomplete'
+grep -q 'Kernel event review: *COMPLETED' "$test_dir/focal-stdout" || fail 'Focal kernel journal coverage incomplete'
+[[ ! -e $test_dir/last-email.eml ]] || fail 'Focal placeholder unexpectedly sent email'
+pass 'Ubuntu 20.04 end-to-end audit and mail placeholder'
+
+# An older Ubuntu release must not be passed off as supported.
+printf 'ID=ubuntu\nVERSION_ID="18.04"\n' > "$test_dir/ubuntu18-os-release"
+env "${ENV_ARGS[@]}" "REPORT_TO=username@email.address" \
+    "OS_RELEASE_FILE=$test_dir/ubuntu18-os-release" \
+    bash "$test_dir/integration.sh" > "$test_dir/bionic-stdout" 2> "$test_dir/bionic-stderr"
+rc=$?
+assert_eq "$rc" 78 'Ubuntu 18.04 must be rejected as outside tested baseline'
+grep -q 'minimum Ubuntu release is 20.04' "$test_dir/bionic-stderr" || fail 'Ubuntu 18.04 explanation missing'
+pass 'Ubuntu 18.04 unvalidated release rejected'
 
 # Invalid exception syntax fails before ordinary report assembly, but must
 # still send a short ERROR email instead of vanishing from scheduled monitoring.
@@ -431,7 +500,7 @@ pass 'placeholder disables early-failure email'
 
 # RPM distributions are no longer blocked at initialization. A separate
 # regression script validates their full package and reporting lifecycle.
-assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.3' 'v2 development version'
+assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.4' 'v2 development version'
 pass 'RPM backend enabled in development release'
 
 # Probe timeout must return 124, and never silently claim the check succeeded.
