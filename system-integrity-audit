@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# system-integrity-audit version 2.0.0-dev.9
+# system-integrity-audit version 2.0.0-dev.10
 # DEVELOPMENT PREVIEW: Debian/Ubuntu and Rocky/RHEL RPM backends.
 # Audit kernel/storage health and native package-managed file integrity.
 
@@ -12,10 +12,13 @@ export PATH
 export LC_ALL=C
 
 PROGRAM_NAME='system-integrity-audit'
-PROGRAM_VERSION='2.0.0-dev.9'
+PROGRAM_VERSION='2.0.0-dev.10'
 readonly PROGRAM_NAME PROGRAM_VERSION
 
 # Changelog:
+#   2.0.0-dev.10 (2026-11-13): Align package backend, verifier exit code,
+#                           and shortened Pkg config/metadata warning labels
+#                           with other report summary value columns.
 #   2.0.0-dev.9 (2026-11-13): Color SMART-TEST progress messages in
 #                          warning yellow, matching terminal stage warnings.
 #                          Preserve plain output when colors are disabled.
@@ -4083,8 +4086,8 @@ change_message=''
     printf 'Exceptions file:                %s\n' "$(sanitize_text "$EXCEPTIONS_FILE")"
     printf 'Exception patterns loaded:      %s\n' "$exception_pattern_count"
     printf 'Approved-missing paths loaded:  %s\n' "$missing_exception_count"
-    printf 'Package backend:                 %s\n' "$PACKAGE_BACKEND"
-    printf 'Package verifier exit code:      %s\n' "$package_verify_status"
+    printf 'Package backend:                %s\n' "$PACKAGE_BACKEND"
+    printf 'Package verifier exit code:     %s\n' "$package_verify_status"
     printf '\n'
 
     printf 'Audit coverage\n'
@@ -4163,7 +4166,7 @@ change_message=''
     printf 'SMART short tests initiated:    %s\n' "$smart_short_test_started_count"
     printf 'SMART short tests skipped:      %s\n' "$smart_short_test_skipped_count"
     printf 'Changed package files:          %s\n' "$changed_count"
-    printf 'Package config/metadata warnings: %s\n' "$package_warning_count"
+    printf 'Pkg config/metadata warnings:   %s\n' "$package_warning_count"
     if [[ $PACKAGE_BACKEND == rpm ]]; then
         printf 'RPM runtime directories absent: %s (NOTICE)\n' "$rpm_runtime_dir_notice_count"
         printf 'RPM timestamp-only skipped:     %s\n' "$rpm_timestamp_ignored_count"
