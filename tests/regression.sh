@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Non-destructive regression fixtures for system-integrity-audit 2.0.0-dev.8.
+# Non-destructive regression fixtures for system-integrity-audit 2.0.0-dev.9.
 # Run: bash tests/regression.sh [path/to/system-integrity-audit]
 set -euo pipefail
 SCRIPT=${1:-"$(dirname "$0")/../system-integrity-audit"}
@@ -346,6 +346,451 @@ smart_line=$(sanitize_smart_detail_line $'Offline status:\tIdle')
 [[ "$smart_line" == *"$actual_tab"* ]] || fail 'SMART report escaped tab instead of retaining it'
 [[ "$smart_line" != *'\t'* ]] || fail 'SMART report printed backslash-t'
 pass 'SMART diagnostic formatting preserves literal tab alignment'
+
+# SMART short-test activity should use exactly the warning-yellow palette
+# when stderr is color-enabled, and remain clean in plain/NO_COLOR output.
+printf 'STARTED\t/dev/sda\tnon-captive short test initiated\n' \
+    > "$smart_short_test_notes_file"
+(
+    PROGRESS_OUTPUT=always
+    progress_color_enabled() { return 0; }
+    print_smart_short_test_progress
+) 2> "$test_dir/smart-test-yellow.txt"
+yellow_expected=SMART_SHORT_TEST_AUTO=0
+
+# Package notification identity must not depend on changed owner text,
+# and the previous hash format should migrate without spurious RESOLVED.
+prior_notification_file=$NOTIFICATION_STATE_FILE
+NOTIFICATION_STATE_FILE=$test_dir/package-identity-state.tsv
+reset_events
+printf 'CONFIG\told-owner [S.5...]\t/etc/sample.conf\n' > "$findings_file"
+assemble_finding_ledger
+prepare_notifications
+assert_eq "$notification_new_count" 1 'first config warning should be new'
+save_notification_state 1
+printf 'CONFIG\tnew-owner, another-owner [S.5...]\t/etc/sample.conf\n' > "$findings_file"
+assemble_finding_ledger
+prepare_notifications
+assert_eq "$notification_ongoing_count" 1 'owner edit must remain ongoing'
+assert_eq "$notification_resolved_count" 0 'owner edit cannot resolve same path warning'
+assert_eq "$notification_new_count" 0 'owner edit cannot create a new path warning'
+pass 'package notification identity ignores owner text changes'
+
+legacy_id=$(printf '%s' 'WARNING|PACKAGE|/etc/sample.conf|CONFIG old-owner' | sha256sum)
+legacy_id=${legacy_id%% *}
+printf '%s\tWARNING\tPACKAGE\t/etc/sample.conf\t%s\n' "$legacy_id" "$(date +%s)" > "$NOTIFICATION_STATE_FILE"
+prepare_notifications
+assert_eq "$notification_ongoing_count" 1 'legacy package state should migrate'
+assert_eq "$notification_resolved_count" 0 'legacy package state must not false-resolve'
+pass 'old package state migrates without false resolution'
+NOTIFICATION_STATE_FILE=$prior_notification_file
+
+MEGARAID_MAX_INDEX=33
+MEGARAID_COMPLETE_SCAN=1
+megaraid_results=$(discover_megaraid_targets /dev/sda)
+[[ $megaraid_results == *'megaraid,1'* ]] || fail 'missed disk beyond scan-open partial enumeration'
+[[ $megaraid_results != *'megaraid,32'* ]] || { printf 'discovery result: %s\n' "$megaraid_results" >&2; fail 'backplane should be skipped'; }
+pass 'partial MegaRAID scan complemented / backplane suppressed'
+
+reset_events
+printf 'WARNING\t/dev/sdb\tModel\tPASSED\n' > "$smart_summary_file"
+assemble_finding_ledger
+prepare_notifications
+assert_eq "$event_alert_count" 0 'smart warning must not imply ALERT'
+assert_eq "$event_warning_count" 1 'SMART warning stays WARNING'
+assert_eq "$notification_due" 1 'first warning should notify'
+save_notification_state 1
+prepare_notifications
+assert_eq "$notification_due" 0 'unchanged warning suppressed until repeat interval'
+assert_eq "$notification_ongoing_count" 1 'ongoing warning tracked'
+: > "$smart_summary_file"
+assemble_finding_ledger
+prepare_notifications
+assert_eq "$notification_resolved_count" 1 'cleared finding triggers resolved notice'
+assert_eq "$notification_due" 1 'resolution report due'
+save_notification_state 1
+pass 'finding ledger / stateful first, ongoing, resolved'
+
+reset_events
+printf 'FAIL\t/dev/sdb\tModel\tFAILED\n' > "$smart_summary_file"
+assemble_finding_ledger
+prepare_notifications
+assert_eq "$event_alert_count" 1 'SMART FAIL emits alert'
+save_notification_state 1
+prepare_notifications
+assert_eq "$notification_due" 1 'ALERT must never be suppressed'
+pass 'critical alerts always notify'
+
+reset_fs
+cat > "$test_dir/fsck-journal" <<EOF
+2026-11-10T10:00:00Z mock systemd-fsck[12]: UNEXPECTED INCONSISTENCY; RUN fsck MANUALLY
+EOF
+check_boot_fsck_results
+assert_eq "$fsck_finding_count" 1 'unloaded failure journal checked with loaded healthy unit'
+assert_eq "$filesystem_alert_count" 1 'unloaded fsck failure alert'
+pass 'loaded clean + unloaded failing fsck journal coverage'
+
+# Kernel journal retention: systemd 255+ can seek to the oldest matching
+# event directly. systemd 249 (Ubuntu 22.04) and 245 (Ubuntu 20.04)
+# must stream only the first entry, without exporting full history.
+KERNEL_LOG_SINCE='7 days ago'
+kernel_scan_error=0
+: > "$execution_notes_file"
+: > "$test_dir/coverage-commands"
+MOCK_SYSTEMD_VERSION=255 MOCK_COVERAGE_MODE=normal
+export MOCK_SYSTEMD_VERSION MOCK_COVERAGE_MODE
+check_kernel_log_coverage
+assert_eq "$kernel_coverage_gap" 0 'systemd 255 coverage complete'
+assert_eq "$kernel_coverage_unknown" 0 'systemd 255 coverage available'
+grep -Fq -- '--lines=+1' "$test_dir/coverage-commands" || fail 'new journalctl did not use oldest-entry option'
+[[ ! -e $test_dir/kernel-coverage-history.txt ]] || fail 'coverage must not dump entire journal history'
+pass 'Ubuntu 24.04 direct oldest kernel entry'
+
+: > "$test_dir/coverage-commands"
+MOCK_SYSTEMD_VERSION=249
+export MOCK_SYSTEMD_VERSION
+check_kernel_log_coverage
+assert_eq "$kernel_coverage_gap" 0 'systemd 249 coverage complete'
+assert_eq "$kernel_coverage_unknown" 0 'systemd 249 coverage available'
+if grep -Fq -- '--lines=+1' "$test_dir/coverage-commands"; then
+    fail 'old journalctl must not use unsupported --lines=+1'
+fi
+if grep -Fq 'WRONG: full history was exported' "$test_dir/coverage-commands"; then
+    fail 'legacy fallback did not stop after one entry'
+fi
+pass 'Ubuntu 22.04 bounded first-entry stream'
+
+# Focal's systemd 245 uses the same bounded stream. A direct +N request
+# would fail on this release; the full-journal export must never occur.
+: > "$test_dir/coverage-commands"
+MOCK_SYSTEMD_VERSION=245 MOCK_COVERAGE_MODE=normal
+export MOCK_SYSTEMD_VERSION MOCK_COVERAGE_MODE
+check_kernel_log_coverage
+assert_eq "$kernel_coverage_gap" 0 'systemd 245 coverage complete'
+assert_eq "$kernel_coverage_unknown" 0 'systemd 245 coverage available'
+if grep -Fq -- '--lines=+1' "$test_dir/coverage-commands"; then
+    fail 'systemd 245 used unsupported --lines=+1'
+fi
+if grep -Fq 'WRONG: full history was exported' "$test_dir/coverage-commands"; then
+    fail 'systemd 245 fallback exported full history'
+fi
+pass 'Ubuntu 20.04 systemd 245 bounded kernel journal coverage'
+
+# systemd-analyze cat-config is present in Ubuntu 20.04. Verify both
+# persistent and volatile settings are interpreted without writing config.
+cat > "$test_dir/bin/systemd-analyze" <<'FOCAL_ANALYZE'
+#!/usr/bin/env bash
+[[ ${1:-} == cat-config && ${2:-} == systemd/journald.conf ]] || exit 2
+printf '# /etc/systemd/journald.conf\n[Journal]\nStorage=%s\n' "${MOCK_JOURNAL_STORAGE_MODE:-auto}"
+FOCAL_ANALYZE
+chmod +x "$test_dir/bin/systemd-analyze"
+MOCK_JOURNAL_STORAGE_MODE=persistent
+export MOCK_JOURNAL_STORAGE_MODE
+assert_eq "$(effective_journal_storage_mode)" 'persistent' 'systemd 245 persistent journald config'
+MOCK_JOURNAL_STORAGE_MODE=volatile
+export MOCK_JOURNAL_STORAGE_MODE
+assert_eq "$(effective_journal_storage_mode)" 'volatile' 'systemd 245 volatile journald config'
+MOCK_JOURNAL_STORAGE_MODE=auto
+export MOCK_JOURNAL_STORAGE_MODE
+pass 'Ubuntu 20.04 journald cat-config compatibility'
+
+MOCK_SYSTEMD_VERSION=255 MOCK_COVERAGE_MODE=error
+export MOCK_SYSTEMD_VERSION MOCK_COVERAGE_MODE
+: > "$execution_notes_file"
+check_kernel_log_coverage
+assert_eq "$kernel_coverage_unknown" 1 'journal query error must be incomplete'
+grep -q 'query failed or timed out' "$execution_notes_file" || fail 'journal query error note missing'
+MOCK_COVERAGE_MODE=empty
+export MOCK_COVERAGE_MODE
+check_kernel_log_coverage
+assert_eq "$kernel_coverage_unknown" 1 'empty journal must be incomplete'
+MOCK_COVERAGE_MODE=short
+export MOCK_COVERAGE_MODE
+check_kernel_log_coverage
+assert_eq "$kernel_coverage_gap" 1 'genuine four-day coverage gap must still be reported'
+assert_eq "$kernel_coverage_unknown" 0 'short but readable history is not a query error'
+MOCK_COVERAGE_MODE=signal
+export MOCK_COVERAGE_MODE
+check_kernel_log_coverage
+assert_eq "$kernel_coverage_unknown" 1 'modern query SIGPIPE must not count as success'
+MOCK_COVERAGE_MODE=timeout
+JOURNAL_TIMEOUT_SECONDS=1
+export MOCK_COVERAGE_MODE JOURNAL_TIMEOUT_SECONDS
+check_kernel_log_coverage
+assert_eq "$kernel_coverage_unknown" 1 'timed-out coverage must be incomplete'
+JOURNAL_TIMEOUT_SECONDS=10
+MOCK_SYSTEMD_VERSION=249 MOCK_COVERAGE_MODE=error
+export JOURNAL_TIMEOUT_SECONDS MOCK_COVERAGE_MODE MOCK_SYSTEMD_VERSION
+check_kernel_log_coverage
+assert_eq "$kernel_coverage_unknown" 1 'legacy query failure must be incomplete'
+MOCK_COVERAGE_MODE=empty
+export MOCK_COVERAGE_MODE
+check_kernel_log_coverage
+assert_eq "$kernel_coverage_unknown" 1 'legacy empty journal must be incomplete'
+MOCK_COVERAGE_MODE=normal
+export JOURNAL_TIMEOUT_SECONDS MOCK_COVERAGE_MODE
+pass 'coverage failures, empty history, short retention, and timeout handled safely'
+
+assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.9' 'embedded version'
+# Confirm both host-changing features are enabled when not set by the caller,
+# but retain explicit safe opt-outs for all integration/regression fixtures.
+defaults=$(env -u AUTO_INSTALL_REQUIREMENTS -u AUTO_ENABLE_PERSISTENT_JOURNAL \
+    bash -c 'source "$1"; printf "%s %s" "$AUTO_INSTALL_REQUIREMENTS" "$AUTO_ENABLE_PERSISTENT_JOURNAL"' \
+    _ "$test_dir/definitions.sh")
+assert_eq "$defaults" '1 1' 'unconfigured host-change defaults are both enabled'
+overrides=$(env AUTO_INSTALL_REQUIREMENTS=0 AUTO_ENABLE_PERSISTENT_JOURNAL=0 \
+    bash -c 'source "$1"; printf "%s %s" "$AUTO_INSTALL_REQUIREMENTS" "$AUTO_ENABLE_PERSISTENT_JOURNAL"' \
+    _ "$test_dir/definitions.sh")
+assert_eq "$overrides" '0 0' 'explicit opt-outs remain effective'
+bash "$SCRIPT" --help | grep -q 'AUTO_INSTALL_REQUIREMENTS=0' || fail 'help omits package-install opt-out'
+bash "$SCRIPT" --help | grep -q 'AUTO_ENABLE_PERSISTENT_JOURNAL=0' || fail 'help omits journald opt-out'
+pass 'automatic-change default-on and explicit opt-out controls'
+bash -n "$SCRIPT"
+pass 'version and Bash syntax'
+
+# End-to-end: execute a temporary copy with non-destructive mocks. This tests
+# the real report-builder/mail path and the preflight email trap, not host APT.
+cat > "$test_dir/bin/debsums" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+  -ca)
+    if [[ -n ${MOCK_DEBSUMS_DIAGNOSTICS_FILE:-} ]]; then
+      cat "$MOCK_DEBSUMS_DIAGNOSTICS_FILE" >&2
+      exit 2
+    fi
+    exit 0
+    ;;
+  -l) exit 0 ;;
+  *) exit 2 ;;
+esac
+EOF
+# The shared integration test simulates Ubuntu even when run on Rocky/RHEL.
+# A Rocky test runner normally has no dpkg-query; provide a deterministic
+# stub instead of accidentally depending on the host's package manager.
+cat > "$test_dir/bin/dpkg-query" <<'EOF'
+#!/usr/bin/env bash
+if [[ ${1:-} == -S && ${2:-} == -- && $# -eq 3 ]]; then
+    printf 'fixture-package: %s\n' "$3"
+    exit 0
+fi
+printf 'unexpected mock dpkg-query arguments: %s\n' "$*" >&2
+exit 2
+EOF
+cat > "$test_dir/bin/sendmail" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" > "$MOCK_DIR/sendmail-args"
+cat > "$MOCK_DIR/last-email.eml"
+EOF
+cat > "$test_dir/bin/logger" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$test_dir/bin/debsums" "$test_dir/bin/dpkg-query" "$test_dir/bin/sendmail" "$test_dir/bin/logger"
+# Verify the fake dpkg command is available and behaves predictably.
+assert_eq "$("$test_dir/bin/dpkg-query" -S -- /usr/bin/fixture)" \
+    'fixture-package: /usr/bin/fixture' 'portable dpkg-query fixture'
+pass 'cross-distribution Ubuntu dpkg-query fixture'
+cp "$SCRIPT" "$test_dir/integration.sh"
+# Only our sandbox copy may be changed: add the fake executable path first.
+sed -i "s@^PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'@PATH='$test_dir/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'@" \
+    "$test_dir/integration.sh"
+rm -f "$test_dir/last-email.eml"
+ENV_ARGS=(
+    "MOCK_DIR=$test_dir"
+    "AUTO_INSTALL_REQUIREMENTS=0"
+    "AUTO_ENABLE_PERSISTENT_JOURNAL=0"
+    "KERNEL_LOG_CHECK_ENABLED=0"
+    "SMART_CHECK_ENABLED=0"
+    "FILESYSTEM_CHECKS_ENABLED=0"
+    "PROGRESS_OUTPUT=never"
+    "TERMINAL_OUTPUT=never"
+    "STATEFUL_NOTIFICATIONS=1"
+    "NOTIFICATION_STATE_FILE=$test_dir/integration-state.tsv"
+    "EXCEPTIONS_FILE=$test_dir/nonexistent-exceptions"
+    "MISSING_EXCEPTIONS_FILE=$test_dir/nonexistent-missing-exceptions"
+    "LOCK_FILE=$test_dir/integration-lock"
+    "REPORT_COVERAGE_GAPS=0"
+    "FORCE_REPORT=1"
+    "REPORT_TO=auditor@example.invalid"
+    "OS_RELEASE_FILE=$test_dir/ubuntu-os-release"
+)
+printf 'ID=ubuntu\n' > "$test_dir/ubuntu-os-release"
+env "${ENV_ARGS[@]}" bash "$test_dir/integration.sh" > "$test_dir/integration-stdout" 2> "$test_dir/integration-stderr"
+rc=$?
+if (( rc != 0 )); then
+    printf 'Full integration audit exited %s. Captured stderr:\n' "$rc" >&2
+    sed -n '1,100p' "$test_dir/integration-stderr" >&2
+fi
+assert_eq "$rc" 0 'full clean report exit success'
+[[ -s $test_dir/last-email.eml ]] || fail 'full clean report email absent'
+grep -q 'Subject: .* TEST/OK - ' "$test_dir/last-email.eml" || fail 'clean status subject'
+grep -q '^From: "System Integrity Audit" <system-integrity-audit>' "$test_dir/last-email.eml" || fail 'visible From header'
+grep -q 'Audit coverage' "$test_dir/last-email.eml" || fail 'coverage section missing'
+grep -q 'Script version: *2.0.0-dev.9' "$test_dir/last-email.eml" || fail 'version absent in report'
+[[ -f $test_dir/integration-state.tsv ]] || fail 'state file not persisted'
+pass 'full clean report, MIME sender, coverage, state persistence'
+
+# End-to-end Focal OS fixture: package verification plus kernel scan and
+# bounded coverage under systemd 245. No package installation, journald
+# changes, or email are allowed in this mode.
+printf 'ID=ubuntu\nVERSION_ID="20.04"\nPRETTY_NAME="Ubuntu 20.04.6 LTS (fixture)"\n' \
+    > "$test_dir/ubuntu20-os-release"
+: > "$test_dir/journal/raw"
+: > "$test_dir/journal/export"
+rm -f "$test_dir/last-email.eml"
+MOCK_SYSTEMD_VERSION=245 MOCK_COVERAGE_MODE=normal MOCK_JOURNAL_STORAGE_MODE=auto
+export MOCK_SYSTEMD_VERSION MOCK_COVERAGE_MODE MOCK_JOURNAL_STORAGE_MODE
+env "${ENV_ARGS[@]}" \
+    "OS_RELEASE_FILE=$test_dir/ubuntu20-os-release" \
+    "REPORT_TO=username@email.address" "KERNEL_LOG_CHECK_ENABLED=1" \
+    "TERMINAL_OUTPUT=always" \
+    "AUTO_INSTALL_REQUIREMENTS=0" "AUTO_ENABLE_PERSISTENT_JOURNAL=0" \
+    "NOTIFICATION_STATE_FILE=$test_dir/focal-state.tsv" \
+    bash "$test_dir/integration.sh" > "$test_dir/focal-stdout" 2> "$test_dir/focal-stderr"
+rc=$?
+if (( rc != 0 )); then
+    printf 'Focal integration audit exited %s. Captured stderr:\n' "$rc" >&2
+    sed -n '1,100p' "$test_dir/focal-stderr" >&2
+fi
+assert_eq "$rc" 0 'Focal full audit returned successful status'
+grep -q 'Ubuntu 20.04.6 LTS (fixture)' "$test_dir/focal-stdout" || fail 'Focal OS missing from report'
+grep -q 'Package-file verification: *COMPLETED' "$test_dir/focal-stdout" || fail 'Focal package audit incomplete'
+grep -q 'Kernel event review: *COMPLETED' "$test_dir/focal-stdout" || fail 'Focal kernel journal coverage incomplete'
+[[ ! -e $test_dir/last-email.eml ]] || fail 'Focal placeholder unexpectedly sent email'
+pass 'Ubuntu 20.04 end-to-end audit and mail placeholder'
+
+# An exact missing-file approval works on Debian/Ubuntu too. It does not
+# inherit modification globs or hide unrelated missing package payloads.
+printf '%s\n' '/usr/lib/expected-missing.so' > "$test_dir/debian-approved-missing.txt"
+cat > "$test_dir/debsums-missing.out" <<'EOF'
+debsums: missing file /usr/lib/expected-missing.so (from fixture package)
+debsums: missing file /usr/lib/unrelated-missing.so (from fixture package)
+EOF
+env "${ENV_ARGS[@]}" "REPORT_TO=username@email.address" \
+    "MOCK_DEBSUMS_DIAGNOSTICS_FILE=$test_dir/debsums-missing.out" \
+    "MISSING_EXCEPTIONS_FILE=$test_dir/debian-approved-missing.txt" \
+    "STATEFUL_NOTIFICATIONS=0" \
+    "NOTIFICATION_STATE_FILE=$test_dir/debian-missing-state.tsv" \
+    "TERMINAL_OUTPUT=always" \
+    bash "$test_dir/integration.sh" > "$test_dir/debian-missing.stdout" 2> "$test_dir/debian-missing.stderr"
+rc=$?
+assert_eq "$rc" 0 'Debian explicit missing exceptions run is not an execution error'
+grep -q 'APPROVED.*expected-missing.so' "$test_dir/debian-missing.stdout" || fail 'Debian explicit missing exception not displayed'
+grep -q 'MISSING.*unrelated-missing.so' "$test_dir/debian-missing.stdout" || fail 'Debian unrelated missing file wrongly suppressed'
+grep -q 'Approved missing files ignored: 1' "$test_dir/debian-missing.stdout" || fail 'Debian approved missing counter inaccurate'
+pass 'Debian/Ubuntu exact missing exception does not hide unrelated missing files'
+
+# Ordinary modification exceptions, including globs, cannot hide missing
+# Debian package files without an explicit exact-path approval.
+printf '/usr/lib/*.so\n' > "$test_dir/debian-modifications.ignore"
+env "${ENV_ARGS[@]}" "REPORT_TO=username@email.address" \
+    "MOCK_DEBSUMS_DIAGNOSTICS_FILE=$test_dir/debsums-missing.out" \
+    "EXCEPTIONS_FILE=$test_dir/debian-modifications.ignore" \
+    "STATEFUL_NOTIFICATIONS=0" "TERMINAL_OUTPUT=always" \
+    bash "$test_dir/integration.sh" > "$test_dir/debian-regular-exceptions.stdout" 2> "$test_dir/debian-regular-exceptions.stderr"
+rc=$?
+assert_eq "$rc" 0 'Debian modification-only exception run exits normally'
+grep -q 'MISSING.*expected-missing.so' "$test_dir/debian-regular-exceptions.stdout" || fail 'Debian missing file was hidden by modifications glob'
+pass 'Debian/Ubuntu modification globs cannot hide missing files'
+
+# An older Ubuntu release must not be passed off as supported.
+printf 'ID=ubuntu\nVERSION_ID="18.04"\n' > "$test_dir/ubuntu18-os-release"
+env "${ENV_ARGS[@]}" "REPORT_TO=username@email.address" \
+    "OS_RELEASE_FILE=$test_dir/ubuntu18-os-release" \
+    bash "$test_dir/integration.sh" > "$test_dir/bionic-stdout" 2> "$test_dir/bionic-stderr"
+rc=$?
+assert_eq "$rc" 78 'Ubuntu 18.04 must be rejected as outside tested baseline'
+grep -q 'minimum Ubuntu release is 20.04' "$test_dir/bionic-stderr" || fail 'Ubuntu 18.04 explanation missing'
+pass 'Ubuntu 18.04 unvalidated release rejected'
+
+# Invalid exception syntax fails before ordinary report assembly, but must
+# still send a short ERROR email instead of vanishing from scheduled monitoring.
+printf 'relative/path\n' > "$test_dir/invalid-exceptions"
+rm -f "$test_dir/last-email.eml"
+env "${ENV_ARGS[@]}" "EXCEPTIONS_FILE=$test_dir/invalid-exceptions" \
+    bash "$test_dir/integration.sh" > "$test_dir/failure-stdout" 2> "$test_dir/failure-stderr"
+rc=$?
+assert_eq "$rc" 65 'early exception error exit'
+[[ -s $test_dir/last-email.eml ]] || fail 'early-failure email absent'
+grep -q 'Subject: .* ERROR - ' "$test_dir/last-email.eml" || fail 'early-failure subject'
+grep -q 'loading exception rules' "$test_dir/last-email.eml" || fail 'failure stage absent'
+pass 'early initialization failure email'
+
+# Explicitly unset recipients must not send and must not claim delivery.
+rm -f "$test_dir/last-email.eml"
+env "${ENV_ARGS[@]}" "REPORT_TO=" "NOTIFICATION_STATE_FILE=$test_dir/no-mail-state.tsv" \
+    bash "$test_dir/integration.sh" > "$test_dir/no-mail-stdout" 2> "$test_dir/no-mail-stderr"
+rc=$?
+assert_eq "$rc" 0 'no-mail audit exits normally'
+[[ ! -e $test_dir/last-email.eml ]] || fail 'no-mail audit unexpectedly sent email'
+pass 'empty recipient disables email'
+
+# Placeholder recipient (and unset REPORT_TO, which uses that default) must
+# never send, and must not claim a notification was delivered.
+rm -f "$test_dir/last-email.eml"
+env "${ENV_ARGS[@]}" "REPORT_TO=username@email.address" \
+    "NOTIFICATION_STATE_FILE=$test_dir/placeholder-state.tsv" \
+    bash "$test_dir/integration.sh" > "$test_dir/placeholder-stdout" 2> "$test_dir/placeholder-stderr"
+rc=$?
+assert_eq "$rc" 0 'placeholder recipient exits normally'
+[[ ! -e $test_dir/last-email.eml ]] || fail 'placeholder recipient unexpectedly sent email'
+pass 'placeholder recipient explicitly disables email'
+
+# Test default behavior with REPORT_TO removed from the environment entirely.
+ENV_DEFAULT_RECIPIENT=()
+for assignment in "${ENV_ARGS[@]}"; do
+    [[ $assignment == REPORT_TO=* ]] || ENV_DEFAULT_RECIPIENT+=("$assignment")
+done
+rm -f "$test_dir/last-email.eml"
+env -u REPORT_TO "${ENV_DEFAULT_RECIPIENT[@]}" \
+    "NOTIFICATION_STATE_FILE=$test_dir/default-mail-state.tsv" \
+    bash "$test_dir/integration.sh" > "$test_dir/default-mail-stdout" 2> "$test_dir/default-mail-stderr"
+rc=$?
+assert_eq "$rc" 0 'default recipient exits normally'
+[[ ! -e $test_dir/last-email.eml ]] || fail 'default recipient unexpectedly sent email'
+pass 'default placeholder disables email'
+
+# Early initialization errors must also leave email disabled on the placeholder.
+rm -f "$test_dir/last-email.eml"
+env "${ENV_ARGS[@]}" "REPORT_TO=username@email.address" \
+    "EXCEPTIONS_FILE=$test_dir/invalid-exceptions" \
+    bash "$test_dir/integration.sh" > "$test_dir/no-error-mail-stdout" 2> "$test_dir/no-error-mail-stderr"
+rc=$?
+assert_eq "$rc" 65 'placeholder early failure exit'
+[[ ! -e $test_dir/last-email.eml ]] || fail 'placeholder sent early-failure email'
+pass 'placeholder disables early-failure email'
+
+# RPM distributions are no longer blocked at initialization. A separate
+# regression script validates their full package and reporting lifecycle.
+assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.9' 'v2 development version'
+pass 'RPM backend enabled in development release'
+
+# Probe timeout must return 124, and never silently claim the check succeeded.
+run_probe 1 sleep 2 > "$test_dir/timeout-out" 2> "$test_dir/timeout-err"
+rc=$?
+assert_eq "$rc" 124 'bounded probe timeout status'
+grep -q 'TIMEOUT' "$test_dir/timeout-err" || fail 'missing timeout diagnostic'
+pass 'bounded external command execution'
+
+echo 'All regression tests passed.'
+
+\033[1m\033[33m[SMART-TEST]\033[0m \033[33mSTARTED /dev/sda: non-captive short test initiated\033[0m'
+assert_eq "$(cat "$test_dir/smart-test-yellow.txt")" "$yellow_expected" 'SMART-TEST uses warning-yellow ANSI styling'
+(
+    PROGRESS_OUTPUT=always
+    progress_color_enabled() { return 1; }
+    print_smart_short_test_progress
+) 2> "$test_dir/smart-test-plain.txt"
+assert_eq "$(cat "$test_dir/smart-test-plain.txt")" \
+    '[SMART-TEST] STARTED /dev/sda: non-captive short test initiated' \
+    'SMART-TEST remains readable without color'
+(
+    PROGRESS_OUTPUT=never
+    print_smart_short_test_progress
+) 2> "$test_dir/smart-test-hidden.txt"
+[[ ! -s $test_dir/smart-test-hidden.txt ]] || fail 'SMART-TEST ignored disabled progress output'
+: > "$smart_short_test_notes_file"
+pass 'SMART-TEST progress uses warning yellow and respects plain/disabled output'
 SMART_SHORT_TEST_AUTO=0
 
 # Package notification identity must not depend on changed owner text,
@@ -521,7 +966,7 @@ MOCK_COVERAGE_MODE=normal
 export JOURNAL_TIMEOUT_SECONDS MOCK_COVERAGE_MODE
 pass 'coverage failures, empty history, short retention, and timeout handled safely'
 
-assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.8' 'embedded version'
+assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.9' 'embedded version'
 # Confirm both host-changing features are enabled when not set by the caller,
 # but retain explicit safe opt-outs for all integration/regression fixtures.
 defaults=$(env -u AUTO_INSTALL_REQUIREMENTS -u AUTO_ENABLE_PERSISTENT_JOURNAL \
@@ -616,7 +1061,7 @@ assert_eq "$rc" 0 'full clean report exit success'
 grep -q 'Subject: .* TEST/OK - ' "$test_dir/last-email.eml" || fail 'clean status subject'
 grep -q '^From: "System Integrity Audit" <system-integrity-audit>' "$test_dir/last-email.eml" || fail 'visible From header'
 grep -q 'Audit coverage' "$test_dir/last-email.eml" || fail 'coverage section missing'
-grep -q 'Script version: *2.0.0-dev.8' "$test_dir/last-email.eml" || fail 'version absent in report'
+grep -q 'Script version: *2.0.0-dev.9' "$test_dir/last-email.eml" || fail 'version absent in report'
 [[ -f $test_dir/integration-state.tsv ]] || fail 'state file not persisted'
 pass 'full clean report, MIME sender, coverage, state persistence'
 
@@ -752,7 +1197,7 @@ pass 'placeholder disables early-failure email'
 
 # RPM distributions are no longer blocked at initialization. A separate
 # regression script validates their full package and reporting lifecycle.
-assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.8' 'v2 development version'
+assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.9' 'v2 development version'
 pass 'RPM backend enabled in development release'
 
 # Probe timeout must return 124, and never silently claim the check succeeded.
