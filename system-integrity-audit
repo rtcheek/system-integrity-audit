@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# system-integrity-audit version 2.0.0-dev.10
+# system-integrity-audit version 2.0.0-dev.11
 # DEVELOPMENT PREVIEW: Debian/Ubuntu and Rocky/RHEL RPM backends.
 # Audit kernel/storage health and native package-managed file integrity.
 
@@ -12,10 +12,14 @@ export PATH
 export LC_ALL=C
 
 PROGRAM_NAME='system-integrity-audit'
-PROGRAM_VERSION='2.0.0-dev.10'
+PROGRAM_VERSION='2.0.0-dev.11'
 readonly PROGRAM_NAME PROGRAM_VERSION
 
 # Changelog:
+#   2.0.0-dev.11 (2026-11-13): Run APT unattended with noninteractive
+#                           debconf, no stdin/PTY prompts, conservative
+#                           conffile handling and foreground timeout job
+#                           control. Do not retry installs after a timeout.
 #   2.0.0-dev.10 (2026-11-13): Align package backend, verifier exit code,
 #                           and shortened Pkg config/metadata warning labels
 #                           with other report summary value columns.
@@ -772,6 +776,35 @@ apt_failure_is_lock_related() {
         "$1"
 }
 
+# GNU timeout normally moves its command to a separate process group. When
+# invoked from a terminal, apt-get/dpkg can then receive SIGTTIN/SIGTTOU and
+# stop indefinitely during package triggers (observed on Ubuntu 24.04).
+# --foreground keeps the command in the terminal's foreground process group.
+# Combined with /dev/null stdin and noninteractive package frontends, this
+# permits unattended operation without prompting or suspending the audit.
+# Note: timeout --foreground cannot terminate grandchildren; after a timeout
+# do not start another package transaction while a child may still be active.
+run_apt_probe() {
+    local seconds=$1 rc
+    shift
+    DEBIAN_FRONTEND=noninteractive \
+    DEBCONF_NONINTERACTIVE_SEEN=true \
+    APT_LISTCHANGES_FRONTEND=none \
+    UCF_FORCE_CONFFOLD=1 \
+        timeout --foreground --signal=TERM --kill-after=5s "$seconds" \
+            apt-get -o Dpkg::Use-Pty=0 \
+                    -o APT::Color=0 \
+                    -o Dpkg::Options::=--force-confdef \
+                    -o Dpkg::Options::=--force-confold \
+                    "$@" </dev/null
+    rc=$?
+    if (( rc == 124 || rc == 137 )); then
+        printf '%s: TIMEOUT: apt-get exceeded %s seconds (exit %s).\n' \
+            "$PROGRAM_NAME" "$seconds" "$rc" >&2
+    fi
+    return "$rc"
+}
+
 run_apt_get_with_retries() {
     local operation_name=$1
     shift
@@ -780,11 +813,18 @@ run_apt_get_with_retries() {
 
     while :; do
         : > "$apt_output_file"
-        run_probe "$APT_COMMAND_TIMEOUT_SECONDS" apt-get "$@" >"$apt_output_file" 2>&1
+        run_apt_probe "$APT_COMMAND_TIMEOUT_SECONDS" "$@" >"$apt_output_file" 2>&1
         rc=$?
 
         if (( rc == 0 )); then
             return 0
+        fi
+
+        if (( rc == 124 || rc == 137 )); then
+            printf '%s: APT timed out during %s; not retrying while package hooks may still run.\n' \
+                "$PROGRAM_NAME" "$operation_name" >&2
+            cat "$apt_output_file" >&2
+            return "$rc"
         fi
 
         if ! apt_failure_is_lock_related "$apt_output_file"; then
@@ -808,6 +848,24 @@ run_apt_get_with_retries() {
     done
 }
 
+run_apt_install_with_refresh() {
+    local rc
+    run_apt_get_with_retries 'package installation' -q -y install "$@"
+    rc=$?
+    if (( rc == 0 )); then
+        return 0
+    fi
+    # A lock or timeout is not a missing-index problem. Never start another
+    # APT transaction when the previous one may still have live children.
+    if (( rc == 75 || rc == 124 || rc == 137 )); then
+        return "$rc"
+    fi
+    printf '%s: initial package installation failed; refreshing APT indexes and retrying.\n' \
+        "$PROGRAM_NAME" >&2
+    run_apt_get_with_retries 'APT index refresh' -q update || return $?
+    run_apt_get_with_retries 'package installation retry' -q -y install "$@"
+}
+
 run_dnf_install() {
     local rc
     # DNF performs its own transaction locking. A bounded invocation prevents
@@ -824,7 +882,6 @@ run_dnf_install() {
 
 install_missing_audit_tools() {
     local -a packages=() missing_commands=()
-    local rc
 
     if [[ $PACKAGE_BACKEND == dpkg ]] && ! command -v debsums >/dev/null 2>&1; then
         packages+=(debsums)
@@ -862,18 +919,7 @@ install_missing_audit_tools() {
     if [[ $PACKAGE_BACKEND == rpm ]]; then
         run_dnf_install "${packages[@]}" || return $?
     else
-        run_apt_get_with_retries 'package installation' \
-            -q -y install "${packages[@]}"
-        rc=$?
-        if (( rc != 0 && rc != 75 )); then
-            printf '%s: initial package installation failed; refreshing APT indexes and retrying.\n' \
-                "$PROGRAM_NAME" >&2
-            run_apt_get_with_retries 'APT index refresh' -q update || return $?
-            run_apt_get_with_retries 'package installation retry' \
-                -q -y install "${packages[@]}" || return $?
-        elif (( rc == 75 )); then
-            return 75
-        fi
+        run_apt_install_with_refresh "${packages[@]}" || return $?
     fi
 
     if [[ $PACKAGE_BACKEND == dpkg ]] && ! command -v debsums >/dev/null 2>&1; then
