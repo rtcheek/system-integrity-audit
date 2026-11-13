@@ -10,6 +10,10 @@
 - **Filesystem, SMART, and RAID:** The existing generic Linux checks are retained. Behavior for particular devices still needs real-host validation.
 - **Ubuntu 18.04 or older:** Explicitly rejected rather than silently claiming a complete audit. The minimum Ubuntu version recognized by this development line is 20.04 LTS.
 
+## Unattended APT prerequisite installation
+
+Since v2.0.0-dev.11, automatic APT installs and index refreshes run noninteractively with stdin closed, dpkg's pseudo-terminal disabled, and GNU `timeout --foreground` so a terminal-attached audit does not stop `apt-get` in a background process group. Conservative conffile options avoid interactive replacement prompts. A timed-out APT transaction is not immediately retried because package-maintenance subprocesses may still be active. This behavior is covered by mocked commands and a pseudo-terminal regression; it has not yet been retested during a live `debsums` reinstall.
+
 ## Regression tests
 
 Run the simulated tests first:
