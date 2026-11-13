@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Non-destructive regression fixtures for system-integrity-audit 2.0.0-dev.10.
+# Non-destructive regression fixtures for system-integrity-audit 2.0.0-dev.11.
 # Run: bash tests/regression.sh [path/to/system-integrity-audit]
 set -euo pipefail
 SCRIPT=${1:-"$(dirname "$0")/../system-integrity-audit"}
@@ -53,6 +53,119 @@ export MOCK_DIR=$test_dir
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "PASS: $*"; }
 assert_eq() { [[ $1 == "$2" ]] || fail "$3 (got '$1', expected '$2')"; }
+PATH="$test_dir/bin:$PATH"
+export PATH
+
+# Simulate APT, not the host package manager.  Verify the complete command
+# environment, input stream, conffile policy, lock retries and timeout policy.
+# The PTY fixture below also checks the process-group bug seen on Ubuntu 24.04.
+cat > "$test_dir/bin/apt-get" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' '--CALL--' >> "$MOCK_DIR/apt-invocations"
+printf '%s\n' "$@" >> "$MOCK_DIR/apt-args"
+printf '%s|%s|%s|%s\n' "${DEBIAN_FRONTEND:-}" "${DEBCONF_NONINTERACTIVE_SEEN:-}" \
+    "${APT_LISTCHANGES_FRONTEND:-}" "${UCF_FORCE_CONFFOLD:-}" > "$MOCK_DIR/apt-environment"
+if [[ -t 0 ]]; then
+    echo 'APT stdin was a terminal, not /dev/null' >&2
+    exit 88
+fi
+case "${MOCK_APT_MODE:-success}" in
+    foreground)
+        read -r pgid < <(ps -o pgid= -p "$$")
+        read -r tpgid < <(ps -o tpgid= -p "$$")
+        printf '%s %s\n' "$pgid" "$tpgid" > "$MOCK_DIR/apt-pgroups"
+        if [[ $pgid != "$tpgid" || $tpgid == -1 ]]; then
+            echo "APT in background process group: pgid=$pgid tpgid=$tpgid" >&2
+            exit 87
+        fi
+        ;;
+    lock_once)
+        if [[ ! -e "$MOCK_DIR/apt-lock-once" ]]; then
+            : > "$MOCK_DIR/apt-lock-once"
+            echo 'E: Could not get lock /var/lib/dpkg/lock-frontend' >&2
+            exit 100
+        fi
+        ;;
+    refresh)
+        if [[ $* == *' install '* && ! -e "$MOCK_DIR/apt-initial-failed" ]]; then
+            : > "$MOCK_DIR/apt-initial-failed"
+            echo 'E: Package debsums has no installation candidate' >&2
+            exit 100
+        fi
+        ;;
+    timeout) exec sleep 3 ;;
+esac
+echo 'simulated APT success'
+EOF
+chmod +x "$test_dir/bin/apt-get"
+apt_output_file=$test_dir/apt-output.txt
+APT_COMMAND_TIMEOUT_SECONDS=5
+APT_LOCK_WAIT_SECONDS=0
+APT_LOCK_RETRY_COUNT=1
+: > "$test_dir/apt-invocations"; : > "$test_dir/apt-args"
+MOCK_APT_MODE=success run_apt_install_with_refresh debsums
+assert_eq "$?" 0 'unattended APT fixture success'
+assert_eq "$(cat "$test_dir/apt-environment")" \
+    'noninteractive|true|none|1' 'APT/dpkg must be noninteractive'
+for option in 'Dpkg::Use-Pty=0' 'APT::Color=0' \
+              'Dpkg::Options::=--force-confdef' 'Dpkg::Options::=--force-confold' \
+              'install' 'debsums'; do
+    grep -Fxq -- "$option" "$test_dir/apt-args" || fail "missing unattended APT argument: $option"
+done
+assert_eq "$(grep -c '^--CALL--$' "$test_dir/apt-invocations")" 1 \
+    'successful APT install should run exactly once'
+pass 'unattended APT environment, closed stdin, conffile policy and install'
+
+: > "$test_dir/apt-invocations"; rm -f "$test_dir/apt-lock-once"
+MOCK_APT_MODE=lock_once run_apt_install_with_refresh debsums
+assert_eq "$?" 0 'APT lock retry eventual success'
+assert_eq "$(grep -c '^--CALL--$' "$test_dir/apt-invocations")" 2 \
+    'APT lock contention should retry exactly once'
+pass 'APT lock contention retry still works'
+
+: > "$test_dir/apt-invocations"; rm -f "$test_dir/apt-initial-failed"
+MOCK_APT_MODE=refresh run_apt_install_with_refresh debsums
+assert_eq "$?" 0 'APT index refresh and install retry'
+assert_eq "$(grep -c '^--CALL--$' "$test_dir/apt-invocations")" 3 \
+    'ordinary APT install error should refresh indexes then retry'
+pass 'APT index-refresh recovery retained for ordinary install failures'
+
+: > "$test_dir/apt-invocations"
+APT_COMMAND_TIMEOUT_SECONDS=1
+MOCK_APT_MODE=timeout run_apt_install_with_refresh debsums > "$test_dir/apt-timeout.out" 2> "$test_dir/apt-timeout.err"
+assert_eq "$?" 124 'APT timeout must terminate and return 124'
+assert_eq "$(grep -c '^--CALL--$' "$test_dir/apt-invocations")" 1 \
+    'timed-out APT transaction must not be retried'
+grep -q 'APT timed out' "$test_dir/apt-timeout.err" || fail 'APT timeout diagnostic absent'
+pass 'APT timeout fails safely without starting another transaction'
+APT_COMMAND_TIMEOUT_SECONDS=5
+
+# A real pseudo-terminal detects timeout's default background-process-group
+# behavior.  Apt-get must inherit the controlling terminal's foreground PGID.
+if command -v script >/dev/null 2>&1; then
+    cat > "$test_dir/apt-pty-fixture.sh" <<'EOF'
+#!/usr/bin/env bash
+source "$MOCK_DIR/definitions.sh"
+PATH="$MOCK_DIR/bin:$PATH"
+export PATH
+apt_output_file="$MOCK_DIR/apt-pty-output.txt"
+APT_COMMAND_TIMEOUT_SECONDS=5
+export MOCK_APT_MODE=foreground
+run_apt_get_with_retries 'PTY process-group check' -q -y install debsums
+EOF
+    chmod +x "$test_dir/apt-pty-fixture.sh"
+    : > "$test_dir/apt-pgroups"
+    script -q -e -c "bash '$test_dir/apt-pty-fixture.sh'" /dev/null \
+        > "$test_dir/apt-pty-stdout" 2> "$test_dir/apt-pty-stderr"
+    assert_eq "$?" 0 'APT PTY foreground fixture must exit successfully'
+    read -r foreground_pgid tty_pgid < "$test_dir/apt-pgroups"
+    [[ -n $foreground_pgid && $foreground_pgid == "$tty_pgid" && $tty_pgid != -1 ]] || \
+        fail 'APT child must stay in the terminal foreground process group'
+    pass 'APT remains in terminal foreground process group under timeout'
+else
+    echo 'SKIP: PTY APT job-control fixture (script command unavailable)'
+fi
+
 reset_fs() {
     : > "$filesystem_findings_file"
     : > "$filesystem_details_file"
@@ -548,7 +661,7 @@ MOCK_COVERAGE_MODE=normal
 export JOURNAL_TIMEOUT_SECONDS MOCK_COVERAGE_MODE
 pass 'coverage failures, empty history, short retention, and timeout handled safely'
 
-assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.10' 'embedded version'
+assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.11' 'embedded version'
 # Confirm both host-changing features are enabled when not set by the caller,
 # but retain explicit safe opt-outs for all integration/regression fixtures.
 defaults=$(env -u AUTO_INSTALL_REQUIREMENTS -u AUTO_ENABLE_PERSISTENT_JOURNAL \
@@ -643,7 +756,7 @@ assert_eq "$rc" 0 'full clean report exit success'
 grep -q 'Subject: .* TEST/OK - ' "$test_dir/last-email.eml" || fail 'clean status subject'
 grep -q '^From: "System Integrity Audit" <system-integrity-audit>' "$test_dir/last-email.eml" || fail 'visible From header'
 grep -q 'Audit coverage' "$test_dir/last-email.eml" || fail 'coverage section missing'
-grep -q 'Script version: *2.0.0-dev.10' "$test_dir/last-email.eml" || fail 'version absent in report'
+grep -q 'Script version: *2.0.0-dev.11' "$test_dir/last-email.eml" || fail 'version absent in report'
 # These labels share a fixed value column (32 characters), in both
 # email text/plain and preformatted HTML. Protect against spacing drift.
 for expected_line in \
@@ -794,7 +907,7 @@ pass 'placeholder disables early-failure email'
 
 # RPM distributions are no longer blocked at initialization. A separate
 # regression script validates their full package and reporting lifecycle.
-assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.10' 'v2 development version'
+assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.11' 'v2 development version'
 pass 'RPM backend enabled in development release'
 
 # Probe timeout must return 124, and never silently claim the check succeeded.
