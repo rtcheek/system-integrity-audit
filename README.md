@@ -2,7 +2,7 @@
 
 Linux package-integrity, storage-health, and filesystem auditing, with terminal and optional multipart email reporting.
 
-> **Development preview:** `2.0.0-dev.9` implements both Debian/Ubuntu (`debsums`) and Rocky Linux/RHEL (`rpm`) package-integrity backends. Regression fixtures pass, and one Rocky Linux 9.8 host has completed a live audit. **Broader Rocky/RHEL host validation and production certification remain pending**. Do not treat this branch as a certified production release. The existing `debsums-audit` v1.7.1 remains the known-working Ubuntu baseline.
+> **Development preview:** `2.0.0-dev.10` implements both Debian/Ubuntu (`debsums`) and Rocky Linux/RHEL (`rpm`) package-integrity backends. Regression fixtures pass, and one Rocky Linux 9.8 host has completed a live audit. **Broader Rocky/RHEL host validation and production certification remain pending**. Do not treat this branch as a certified production release. The existing `debsums-audit` v1.7.1 remains the known-working Ubuntu baseline.
 
 ## Platform support
 
@@ -97,6 +97,8 @@ sudo env AUTO_INSTALL_REQUIREMENTS=0 AUTO_ENABLE_PERSISTENT_JOURNAL=0 \
 ```
 
 The controls are independent: set either to `0` to disable just that action. Neither setting disables local lock/state writes or SMART self-test initiation; use `SMART_SHORT_TEST_AUTO=0` separately to opt out of firmware tests. The placeholder `REPORT_TO` still disables email.
+
+The report's package-backend and verifier-exit fields use the same fixed-width value column as other summary fields. The count label is abbreviated to `Pkg config/metadata warnings` to preserve alignment in both plain-text and HTML email reports.
 
 ## Development tests
 
