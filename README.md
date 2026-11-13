@@ -2,7 +2,7 @@
 
 Linux package-integrity, storage-health, and filesystem auditing, with terminal and optional multipart email reporting.
 
-> **Development preview:** `2.0.0-dev.8` implements both Debian/Ubuntu (`debsums`) and Rocky Linux/RHEL (`rpm`) package-integrity backends. Regression fixtures pass, and one Rocky Linux 9.8 host has completed a live audit. **Broader Rocky/RHEL host validation and production certification remain pending**. Do not treat this branch as a certified production release. The existing `debsums-audit` v1.7.1 remains the known-working Ubuntu baseline.
+> **Development preview:** `2.0.0-dev.9` implements both Debian/Ubuntu (`debsums`) and Rocky Linux/RHEL (`rpm`) package-integrity backends. Regression fixtures pass, and one Rocky Linux 9.8 host has completed a live audit. **Broader Rocky/RHEL host validation and production certification remain pending**. Do not treat this branch as a certified production release. The existing `debsums-audit` v1.7.1 remains the known-working Ubuntu baseline.
 
 ## Platform support
 
@@ -46,7 +46,7 @@ The RPM scan calls `rpm -Va --noscripts --noghost` with a timeout. Verification 
 - A one-second aggregate `/proc/stat` CPU sample measures **idle strictly above 98%** and **I/O wait strictly below 2%**. If metrics are unavailable or thresholds fail, the test is skipped.
 - No other test has been started during this audit. The script never uses captive mode or a force flag, does not wait for completion, and stores a root-only start timestamp before dispatching the command to prevent duplicate starts.
 
-SMART short-test activity appears in the terminal progress and full report, with `STARTED`, `SKIPPED`, or `DISABLED` and the reason. Logged self-test results are examined on subsequent audits. Other health checks still run on NVMe, SCSI, and RAID devices, but **automatic test initiation skips them** until their semantics are separately validated.
+SMART short-test activity appears in the terminal progress and full report, with `STARTED`, `SKIPPED`, or `DISABLED` and the reason. On color-capable terminals, `[SMART-TEST]` progress uses the same warning-yellow coloring as `[WARN]`; plain output and `NO_COLOR` remain unchanged. Logged self-test results are examined on subsequent audits. Other health checks still run on NVMe, SCSI, and RAID devices, but **automatic test initiation skips them** until their semantics are separately validated.
 
 To opt out for a single run:
 
