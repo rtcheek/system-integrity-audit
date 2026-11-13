@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# system-integrity-audit version 2.0.0-dev.8
+# system-integrity-audit version 2.0.0-dev.9
 # DEVELOPMENT PREVIEW: Debian/Ubuntu and Rocky/RHEL RPM backends.
 # Audit kernel/storage health and native package-managed file integrity.
 
@@ -12,10 +12,13 @@ export PATH
 export LC_ALL=C
 
 PROGRAM_NAME='system-integrity-audit'
-PROGRAM_VERSION='2.0.0-dev.8'
+PROGRAM_VERSION='2.0.0-dev.9'
 readonly PROGRAM_NAME PROGRAM_VERSION
 
 # Changelog:
+#   2.0.0-dev.9 (2026-11-13): Color SMART-TEST progress messages in
+#                          warning yellow, matching terminal stage warnings.
+#                          Preserve plain output when colors are disabled.
 #   2.0.0-dev.8 (2026-11-12): Enable automatic prerequisite installation
 #                          and persistent journald setup by default. Both
 #                          remain individually opt-out environment settings.
@@ -1618,6 +1621,26 @@ smart_short_test_note() {
         STARTED) smart_short_test_started_count=$((smart_short_test_started_count+1)) ;;
         SKIPPED|DISABLED|FAILED) smart_short_test_skipped_count=$((smart_short_test_skipped_count+1)) ;;
     esac
+}
+
+# SMART self-test messages use the same warning-yellow palette as [WARN]
+# progress stages. Keep progress controls, NO_COLOR, and non-TTY behavior.
+print_smart_short_test_progress() {
+    local test_state test_device test_note
+    local color_reset='' color_bold='' color_yellow=''
+    progress_output_enabled && [[ -s $smart_short_test_notes_file ]] || return 0
+
+    if progress_color_enabled; then
+        color_reset=$'\033[0m'
+        color_bold=$'\033[1m'
+        color_yellow=$'\033[33m'
+    fi
+
+    while IFS=$'\t' read -r test_state test_device test_note; do
+        printf '%s%s[SMART-TEST]%s %s%s %s: %s%s\n' \
+            "$color_bold" "$color_yellow" "$color_reset" \
+            "$color_yellow" "$test_state" "$test_device" "$test_note" "$color_reset" >&2
+    done < "$smart_short_test_notes_file"
 }
 
 # Persist intent BEFORE dispatching the firmware test. If the process dies
@@ -3882,11 +3905,7 @@ if is_enabled "$SMART_CHECK_ENABLED"; then
     else
         progress_finish done
     fi
-    if progress_output_enabled && [[ -s $smart_short_test_notes_file ]]; then
-        while IFS=$'	' read -r test_state test_device test_note; do
-            printf '[SMART-TEST] %s %s: %s\n' "$test_state" "$test_device" "$test_note" >&2
-        done < "$smart_short_test_notes_file"
-    fi
+    print_smart_short_test_progress
 else
     progress_skip 'SMART checks disabled'
 fi
