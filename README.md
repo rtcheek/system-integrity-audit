@@ -2,7 +2,7 @@
 
 Linux package-integrity, storage-health, and filesystem auditing, with terminal and optional multipart email reporting.
 
-Version **2.0.0** provides Debian/Ubuntu (`debsums`) and Rocky Linux/RHEL (`rpm`) package-integrity backends. Live audits and automatic prerequisite reinstallation have completed on Ubuntu 24.04 and Rocky Linux 9.8. Check-only XFS scans of `/`, `/boot`, and `/home` completed successfully on the Rocky test host. The platform table below distinguishes live validation from simulated coverage and experimental platforms.
+Version **2.0.1** provides Debian/Ubuntu (`debsums`) and Rocky Linux/RHEL (`rpm`) package-integrity backends. Live audits and automatic prerequisite reinstallation have completed on Ubuntu 24.04 and Rocky Linux 9.8. Check-only XFS scans of `/`, `/boot`, and `/home` completed successfully on the Rocky test host. The platform table below distinguishes live validation from simulated coverage and experimental platforms.
 
 ## Get started
 
@@ -13,9 +13,43 @@ git switch main
 ./system-integrity-audit --version
 sudo bash tests/regression.sh
 sudo bash tests/rpm-regression.sh
+bash tests/install-regression.sh
 ```
 
-Expected version: `system-integrity-audit 2.0.0`. Review the automatic-change defaults below before running an audit as root. For an existing checkout, switch to `main` and run `git pull --ff-only` before checking the version.
+Expected version: `system-integrity-audit 2.0.1`. Review the automatic-change defaults below before running an audit as root. For an existing checkout, switch to `main` and run `git pull --ff-only` before checking the version.
+
+## Install and schedule weekly audits
+
+From the repository checkout:
+
+```bash
+sudo ./install.sh
+```
+
+The installer uses the audit's status colors: cyan for notices, yellow for installation activity and warnings, green for completed steps, and red for failures. It honors `NO_COLOR` and uses plain output when redirected.
+
+It prompts for one default report email address, prepares an installed copy with that address, installs it as root-owned mode `0755` at `/usr/local/sbin/system-integrity-audit`, and creates `/etc/cron.weekly/system-integrity-audit` as a symlink to that executable. The repository script keeps its placeholder. Enter `none` to disable email; on upgrades, press Enter to retain the installed default address.
+
+For a noninteractive installation:
+
+```bash
+sudo ./install.sh --email admin@example.org
+# Or disable email:
+sudo ./install.sh --no-email
+```
+
+Email delivery requires a configured sendmail-compatible mailer. The installer does not run the audit or send a test message. Weekly execution depends on the host's existing cron/anacron setup; the installer requires `/etc/cron.weekly` to exist and does not configure the scheduling service.
+
+To update an installation, pull `main` and rerun the installer:
+
+```bash
+git pull --ff-only
+sudo ./install.sh
+```
+
+The installer reuses its existing weekly symlink and refuses to overwrite an unrelated weekly entry or a symlinked executable target. It stages and syntax-checks the personalized executable before replacing the installed copy. The installed email default is offered again; other manual changes to the installed script are replaced by the repository version. Runtime `REPORT_TO` overrides still work.
+
+Other audit defaults remain as documented below, including automatic prerequisite installation, persistent-journal setup, and conservative SMART test initiation. XFS check-only scheduling remains opt-in; this installer prompts only for the report address.
 
 ## Platform support
 
@@ -141,11 +175,14 @@ The report's package-backend and verifier-exit fields use the same fixed-width v
 
 ## Regression tests
 
+The installer suite uses private staging directories and makes no changes to system installation or cron paths. It can run without root.
+
 ```bash
 git switch main
 bash ./system-integrity-audit --version
 sudo bash tests/regression.sh
 sudo bash tests/rpm-regression.sh
+bash tests/install-regression.sh
 ```
 
 The shared suite includes unattended APT command, timeout, lock-retry and pseudo-terminal job-control tests, SMART self-test scheduling, report formatting, stable-notification identity and approved-missing regression cases and also mocks Ubuntu's `dpkg-query`, so its Ubuntu scenarios run on RPM-based test hosts without requiring Debian packages. The regression suites use simulated hardware, journals, RPM results, and email. They cannot validate real device and storage behavior. Inspect the report's **Audit coverage** section and review all unexpected RPM differences on your actual machine before wider deployment.
