@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# system-integrity-audit version 2.0.1
+# system-integrity-audit version 2.0.2
 # Debian/Ubuntu and Rocky/RHEL RPM backends.
 # Audit kernel/storage health and native package-managed file integrity.
 
@@ -12,10 +12,13 @@ export PATH
 export LC_ALL=C
 
 PROGRAM_NAME='system-integrity-audit'
-PROGRAM_VERSION='2.0.1'
+PROGRAM_VERSION='2.0.2'
 readonly PROGRAM_NAME PROGRAM_VERSION
 
 # Changelog:
+#   2.0.2 (2026-11-13): Remove legacy debsums-audit executables and
+#                       daily/weekly cron symlinks after successful setup
+#                       through the companion installer.
 #   2.0.1 (2026-11-13): Add the companion interactive installer for a
 #                       local default report email, executable installation
 #                       and weekly cron symlink; retain audit behavior.

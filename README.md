@@ -2,7 +2,7 @@
 
 Linux package-integrity, storage-health, and filesystem auditing, with terminal and optional multipart email reporting.
 
-Version **2.0.1** provides Debian/Ubuntu (`debsums`) and Rocky Linux/RHEL (`rpm`) package-integrity backends. Live audits and automatic prerequisite reinstallation have completed on Ubuntu 24.04 and Rocky Linux 9.8. Check-only XFS scans of `/`, `/boot`, and `/home` completed successfully on the Rocky test host. The platform table below distinguishes live validation from simulated coverage and experimental platforms.
+Version **2.0.2** provides Debian/Ubuntu (`debsums`) and Rocky Linux/RHEL (`rpm`) package-integrity backends. Live audits and automatic prerequisite reinstallation have completed on Ubuntu 24.04 and Rocky Linux 9.8. Check-only XFS scans of `/`, `/boot`, and `/home` completed successfully on the Rocky test host. The platform table below distinguishes live validation from simulated coverage and experimental platforms.
 
 ## Get started
 
@@ -16,7 +16,7 @@ sudo bash tests/rpm-regression.sh
 bash tests/install-regression.sh
 ```
 
-Expected version: `system-integrity-audit 2.0.1`. Review the automatic-change defaults below before running an audit as root. For an existing checkout, switch to `main` and run `git pull --ff-only` before checking the version.
+Expected version: `system-integrity-audit 2.0.2`. Review the automatic-change defaults below before running an audit as root. For an existing checkout, switch to `main` and run `git pull --ff-only` before checking the version.
 
 ## Install and schedule weekly audits
 
@@ -48,6 +48,8 @@ sudo ./install.sh
 ```
 
 The installer reuses its existing weekly symlink and refuses to overwrite an unrelated weekly entry or a symlinked executable target. It stages and syntax-checks the personalized executable before replacing the installed copy. The installed email default is offered again; other manual changes to the installed script are replaced by the repository version. Runtime `REPORT_TO` overrides still work.
+
+After the new executable and weekly symlink are installed successfully, the installer removes legacy `debsums-audit` files or symlinks from `/usr/local/bin` and `/usr/local/sbin`. It removes symlinks named `debsums-audit` in `/etc/cron.daily` and `/etc/cron.weekly`, plus other symlinks in those directories that lead to either legacy executable path. Relative, chained and dangling legacy links are included. Each removal is reported. Regular cron files and non-file legacy paths are retained with a warning for manual review; symlink targets outside the two legacy executable paths are not deleted. Failed installation or input validation leaves the old installation alone. Already-running legacy processes are not stopped.
 
 Other audit defaults remain as documented below, including automatic prerequisite installation, persistent-journal setup, and conservative SMART test initiation. XFS check-only scheduling remains opt-in; this installer prompts only for the report address.
 

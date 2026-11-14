@@ -7,9 +7,11 @@ PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 export PATH
 export LC_ALL=C
 
-INSTALLER_VERSION='2.0.1'
+INSTALLER_VERSION='2.0.2'
 INSTALL_DIR='/usr/local/sbin'
 CRON_DIR='/etc/cron.weekly'
+LEGACY_BIN_DIR='/usr/local/bin'
+DAILY_CRON_DIR='/etc/cron.daily'
 PLACEHOLDER='username@email.address'
 work_dir=''
 staged_install=''
@@ -37,13 +39,68 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM HUP
+# Follow only cron symlink chains, comparing each hop before dereferencing
+# the old executable itself. This also works for dangling legacy links and
+# avoids treating a legacy alias of the NEW audit as a reason to remove it.
+links_to_legacy_audit() {
+    local cursor=$1 raw parent leaf hop
+    for ((hop=0; hop<40; hop++)); do
+        [[ -L $cursor ]] || return 1
+        raw=$(readlink -- "$cursor") || return 1
+        [[ $raw == /* ]] || raw="${cursor%/*}/$raw"
+        parent=${raw%/*}; leaf=${raw##*/}
+        parent=$(readlink -m -- "$parent") || return 1
+        cursor="${parent%/}/$leaf"
+        [[ $cursor != "$LEGACY_BIN_DIR/debsums-audit" &&
+           $cursor != "$INSTALL_DIR/debsums-audit" ]] || return 0
+    done
+    return 1
+}
+remove_legacy_installation() {
+    local dir entry old removed=0
+    local -a old_links=()
+    status NOTICE 'Checking for legacy debsums-audit installations and cron symlinks'
+    # Collect links before removing any, so aliases through other cron links
+    # are still discoverable. Include hidden entries without following dirs.
+    for dir in "$DAILY_CRON_DIR" "$CRON_DIR"; do
+        [[ -d $dir ]] || continue
+        for entry in "$dir/"* "$dir/".[!.]* "$dir/"..?*; do
+            if [[ -L $entry ]]; then
+                if [[ ${entry##*/} == debsums-audit ]] || links_to_legacy_audit "$entry"; then
+                    old_links+=("$entry")
+                fi
+            elif [[ ${entry##*/} == debsums-audit && -e $entry ]]; then
+                status WARN "Keeping non-symlink cron entry for manual review: $entry"
+            fi
+        done
+    done
+    for entry in "${old_links[@]}"; do
+        rm -f -- "$entry" || die "New installation is ready, but could not remove legacy cron symlink: $entry"
+        status OK "Removed legacy cron symlink: $entry"
+        removed=$((removed + 1))
+    done
+    for old in "$LEGACY_BIN_DIR/debsums-audit" "$INSTALL_DIR/debsums-audit"; do
+        if [[ -L $old || -f $old ]]; then
+            rm -f -- "$old" || die "New installation is ready, but could not remove legacy script: $old"
+            status OK "Removed legacy script: $old"
+            removed=$((removed + 1))
+        elif [[ -e $old ]]; then
+            status WARN "Keeping non-file legacy path for manual review: $old"
+        fi
+    done
+    (( removed != 0 )) || status OK 'No legacy debsums-audit files or cron symlinks to remove'
+    return 0
+}
+
 usage() {
     cat <<'USAGE'
 Usage: sudo ./install.sh [--email ADDRESS | --no-email]
 
 Prompts for a report email address, installs a personalized copy into
 /usr/local/sbin/system-integrity-audit, and creates the weekly symlink
-/etc/cron.weekly/system-integrity-audit. Does not run the audit.
+/etc/cron.weekly/system-integrity-audit. After successful installation,
+removes legacy debsums-audit files in /usr/local/bin and /usr/local/sbin
+and their daily/weekly cron symlinks. Does not run the audit.
 
 An existing installed default address is offered again during upgrades.
 Press Enter to retain the offered value, or enter none to disable email.
@@ -163,5 +220,6 @@ else
     ln -s -- "$target" "$weekly" || die "Script installed, but weekly symlink creation failed: $weekly"
     status OK "Created weekly symlink: $weekly"
 fi
+remove_legacy_installation
 status NOTICE 'Weekly execution uses the existing cron/anacron schedule. The audit was not run.'
 status NOTICE 'Other audit defaults are unchanged; XFS check-only scrubbing remains opt-in.'
