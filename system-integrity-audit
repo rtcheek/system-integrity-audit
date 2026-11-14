@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# system-integrity-audit version 2.0.0-dev.13
+# system-integrity-audit version 2.0.0-dev.14
 # DEVELOPMENT PREVIEW: Debian/Ubuntu and Rocky/RHEL RPM backends.
 # Audit kernel/storage health and native package-managed file integrity.
 
@@ -12,10 +12,13 @@ export PATH
 export LC_ALL=C
 
 PROGRAM_NAME='system-integrity-audit'
-PROGRAM_VERSION='2.0.0-dev.13'
+PROGRAM_VERSION='2.0.0-dev.14'
 readonly PROGRAM_NAME PROGRAM_VERSION
 
 # Changelog:
+#   2.0.0-dev.14 (2026-11-13): Add opt-in weekly XFS check-only scrubs
+#                           with UUID-based persistent results, timeouts,
+#                           duplicate/overlap guards and no timer changes.
 #   2.0.0-dev.13 (2026-11-13): Label prerequisite installation with
 #                           warning-yellow [INSTALLING] progress; honor
 #                           NO_COLOR and plain/disabled progress output.
@@ -207,6 +210,10 @@ LVM_THIN_NOTICE_PERCENT="${LVM_THIN_NOTICE_PERCENT:-80}"
 LVM_THIN_WARNING_PERCENT="${LVM_THIN_WARNING_PERCENT:-90}"
 LVM_THIN_ALERT_PERCENT="${LVM_THIN_ALERT_PERCENT:-95}"
 SCRUB_MAX_AGE_DAYS="${SCRUB_MAX_AGE_DAYS:-45}"
+XFS_SCRUB_AUTO="${XFS_SCRUB_AUTO:-0}"
+XFS_SCRUB_INTERVAL_DAYS="${XFS_SCRUB_INTERVAL_DAYS:-7}"
+XFS_SCRUB_TIMEOUT_SECONDS="${XFS_SCRUB_TIMEOUT_SECONDS:-3600}"
+XFS_SCRUB_STATE_DIR="${XFS_SCRUB_STATE_DIR:-/var/lib/system-integrity-audit/xfs-scrub}"
 PROC_MDSTAT_PATH="${PROC_MDSTAT_PATH:-/proc/mdstat}"
 SYS_BLOCK_DIR="${SYS_BLOCK_DIR:-/sys/block}"
 APT_LOCK_WAIT_SECONDS="${APT_LOCK_WAIT_SECONDS:-240}"
@@ -279,6 +286,10 @@ Environment overrides:
   LVM_THIN_WARNING_PERCENT=90       LVM thin-pool WARNING threshold
   LVM_THIN_ALERT_PERCENT=95         LVM thin-pool ALERT threshold
   SCRUB_MAX_AGE_DAYS=45             NOTICE when recorded scrub is older
+  XFS_SCRUB_AUTO=1                  Opt in to periodic xfs_scrub -n checks
+  XFS_SCRUB_INTERVAL_DAYS=7         Minimum days between attempts per XFS UUID
+  XFS_SCRUB_TIMEOUT_SECONDS=3600    Maximum seconds per check-only XFS scan
+  XFS_SCRUB_STATE_DIR=path          Private persistent XFS results directory
   APT_LOCK_WAIT_SECONDS=240         Seconds between package-lock retries (apt/dnf)
   APT_LOCK_RETRY_COUNT=5            Retries for apt/dnf locks
   MEGARAID_MAX_INDEX=63             Highest physical-drive index to probe if scan fails
@@ -2891,6 +2902,185 @@ check_timer_health() {
     esac
 }
 
+xfs_scrub_problem() {
+    filesystem_check_error_count=$((filesystem_check_error_count + 1))
+    add_filesystem_finding WARNING 'XFS-SCRUB' "$1" "$2"
+}
+
+# Only the audit's private state is written. Reject symlinked components,
+# non-private state, and malformed records rather than risking a repeated scan.
+prepare_xfs_scrub_state() {
+    local part path='' owner_mode
+    local -a parts=()
+    [[ $XFS_SCRUB_STATE_DIR == /* && $XFS_SCRUB_STATE_DIR != */ &&
+       $XFS_SCRUB_STATE_DIR != *$'\n'* && $XFS_SCRUB_STATE_DIR != *$'\t'* ]] || return 1
+    IFS=/ read -r -a parts <<< "$XFS_SCRUB_STATE_DIR"
+    for part in "${parts[@]}"; do
+        [[ -n $part ]] || continue
+        [[ $part != . && $part != .. ]] || return 1
+        path+="/$part"
+        [[ ! -L $path ]] || return 1
+    done
+    mkdir -p -- "$XFS_SCRUB_STATE_DIR" || return 1
+    owner_mode=$(stat -c '%u:%a' -- "$XFS_SCRUB_STATE_DIR") || return 1
+    [[ $owner_mode == "$EUID:700" ]]
+}
+
+write_xfs_scrub_state() {
+    local state=$1 epoch=$2 result=$3 log=${4:-} temp
+    temp=$(mktemp "$XFS_SCRUB_STATE_DIR/.result.XXXXXX") || return 1
+    if ! { printf '%s\t%s\n' "$epoch" "$result" > "$temp" &&
+           { [[ -z $log ]] || cat -- "$log" >> "$temp"; } &&
+           mv -f -- "$temp" "$state"; }; then
+        rm -f -- "$temp"
+        return 1
+    fi
+}
+
+report_xfs_scrub_result() {
+    local target=$1 state=$2 epoch=$3 result=$4 stamp
+    stamp=$(date -d "@$epoch" --iso-8601=seconds 2>/dev/null) || stamp=$epoch
+    case "$result" in
+        0)
+            add_filesystem_finding NOTICE 'XFS-SCRUB' "$target" \
+                "Last check-only scrub: $stamp, exit 0 (no errors reported); interval ${XFS_SCRUB_INTERVAL_DAYS}d."
+            ;;
+        2)
+            add_filesystem_finding NOTICE 'XFS-SCRUB' "$target" \
+                "Last check-only scrub: $stamp, exit 2 (optimizations possible; none requested)."
+            ;;
+        RUNNING)
+            xfs_scrub_problem "$target" "Previous check-only scrub at $stamp was interrupted or its result could not be saved; coverage incomplete."
+            ;;
+        *)
+            # xfs_scrub uses bits 1=uncorrected errors, 2=optimizations,
+            # 4=operational error, 8=usage error. Signals/timeouts are NOT bits.
+            if (( result < 16 && (result & 1) != 0 )); then
+                add_filesystem_finding ALERT 'XFS-SCRUB' "$target" \
+                    "Last check-only scrub: $stamp, exit $result (uncorrected filesystem errors reported); review scrub output."
+            fi
+            if (( result >= 16 || (result & 12) != 0 )); then
+                xfs_scrub_problem "$target" "Last check-only scrub: $stamp, exit $result; scan incomplete (timeout, command failure or unsupported operation)."
+            fi
+            ;;
+    esac
+    sed '1d' "$state" > "$work_dir/xfs-scrub-last-output.txt"
+    append_filesystem_details "XFS check-only scrub: $target ($stamp, result $result)" \
+        "$work_dir/xfs-scrub-last-output.txt"
+}
+
+print_xfs_scrub_progress() {
+    local color_reset='' color_bold='' color_yellow=''
+    progress_output_enabled || return 0
+    progress_stop
+    if progress_color_enabled; then
+        color_reset=$'\033[0m'; color_bold=$'\033[1m'; color_yellow=$'\033[33m'
+    fi
+    printf '%s%s[XFS-SCRUB]%s %s%s%s\n' "$color_bold" "$color_yellow" \
+        "$color_reset" "$color_yellow" "$(sanitize_text "$1")" "$color_reset" >&2
+}
+
+run_scheduled_xfs_scrubs() {
+    local source target fstype options identity uuid fsroot state epoch result extra
+    local now log rc blocker='' enabled active load_state service_active probe_rc
+    local -A checked=()
+    is_enabled "$XFS_SCRUB_AUTO" || return 0
+    if ! require_commands xfs_scrub stat pgrep; then
+        xfs_scrub_problem 'scheduler' 'Check-only XFS scrubbing enabled but required commands are missing; nothing started.'
+        return 0
+    fi
+    if ! prepare_xfs_scrub_state; then
+        xfs_scrub_problem 'scheduler' 'Unsafe or unavailable XFS state directory; require an absolute, private directory (mode 0700), without symlinks, owned by the audit user. Nothing started.'
+        return 0
+    fi
+    now=$(date +%s)
+    [[ $now =~ ^[0-9]{1,10}$ ]] || { xfs_scrub_problem 'scheduler' 'Invalid clock; nothing started.'; return 0; }
+    enabled=$(run_probe "$PROBE_TIMEOUT_SECONDS" systemctl is-enabled xfs_scrub_all.timer 2>/dev/null || true)
+    active=$(run_probe "$PROBE_TIMEOUT_SECONDS" systemctl is-active xfs_scrub_all.timer 2>/dev/null || true)
+    load_state=$(run_probe "$PROBE_TIMEOUT_SECONDS" systemctl show xfs_scrub_all.timer -p LoadState --value 2>/dev/null || true)
+    service_active=$(run_probe "$PROBE_TIMEOUT_SECONDS" systemctl is-active xfs_scrub_all.service 2>/dev/null || true)
+    if [[ $load_state == not-found && ( $active == inactive || $active == unknown ) ]]; then
+        : # A verified absent timer cannot schedule another scrub.
+    else
+        case "$enabled:$active" in
+            disabled:inactive|disabled:failed|masked:inactive|masked:failed|not-found:inactive|not-found:unknown) ;;
+            *) blocker='Stock XFS scrub timer is enabled, active, or its state is unknown.' ;;
+        esac
+    fi
+    case "$service_active" in
+        active|activating|deactivating) blocker='Stock XFS scrub service is active.' ;;
+    esac
+
+    while IFS=$'\t' read -r source target fstype options; do
+        [[ $fstype == xfs ]] || continue
+        if [[ $target != /* || $target == *$'\n'* ]] || mount_option_present "$options" bind; then
+            add_filesystem_finding NOTICE 'XFS-SCRUB' "$target" 'Bind or unsupported mount path skipped.'
+            continue
+        fi
+        # Require a real filesystem root, not a bind of a subdirectory. UUID
+        # keeps scheduling stable across device aliases and deduplicates mounts.
+        identity=$(run_probe "$PROBE_TIMEOUT_SECONDS" findmnt -rn -T "$target" -o FSTYPE,UUID,FSROOT 2>/dev/null) || identity=''
+        read -r fstype uuid fsroot extra <<< "$identity"
+        if [[ $fstype != xfs || $fsroot != / || -n $extra ||
+              ! $uuid =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]]; then
+            xfs_scrub_problem "$target" 'Cannot verify mounted XFS UUID and filesystem root; check-only scrub skipped.'
+            continue
+        fi
+        uuid=${uuid,,}
+        [[ -z ${checked[$uuid]+x} ]] || continue
+        checked[$uuid]=1
+        state="$XFS_SCRUB_STATE_DIR/$uuid.state"
+        epoch=0; result=''
+        if [[ -e $state || -L $state ]]; then
+            if [[ -L $state || ! -f $state || $(stat -c '%u:%a' -- "$state") != "$EUID:600" ]] ||
+               ! IFS=$'\t' read -r epoch result extra < "$state" ||
+               [[ ! $epoch =~ ^[0-9]{1,10}$ || -n $extra ||
+                  ! $result =~ ^(RUNNING|[0-9]{1,3})$ ]]; then
+                xfs_scrub_problem "$target" 'Unsafe or malformed XFS state record; no scan started.'
+                continue
+            fi
+            epoch=$((10#$epoch))
+            if [[ $result != RUNNING ]]; then
+                result=$((10#$result))
+                if (( result > 255 )); then
+                    xfs_scrub_problem "$target" 'Invalid saved XFS result; no scan started.'
+                    continue
+                fi
+            fi
+        fi
+        if (( epoch > now )); then
+            xfs_scrub_problem "$target" 'Saved XFS check time is in the future; no scan started.'
+        elif [[ -n $result ]] && (( now - epoch < XFS_SCRUB_INTERVAL_DAYS * 86400 )); then
+            : # Retain and report prior results until the next weekly attempt.
+        elif [[ -n $blocker ]]; then
+            add_filesystem_finding NOTICE 'XFS-SCRUB' "$target" "$blocker Check-only scrub skipped; no timer configuration changed."
+        else
+            # Check before EACH filesystem, including manual or templated jobs.
+            run_probe "$PROBE_TIMEOUT_SECONDS" pgrep -x 'xfs_scrub|xfs_scrub_all' >/dev/null 2>&1
+            probe_rc=$?
+            if (( probe_rc == 0 )); then
+                add_filesystem_finding NOTICE 'XFS-SCRUB' "$target" 'Another scrub is running; check-only scrub skipped.'
+            elif (( probe_rc != 1 )); then
+                xfs_scrub_problem "$target" 'Scrub process detection failed; check-only scrub skipped.'
+            elif ! write_xfs_scrub_state "$state" "$now" RUNNING; then
+                xfs_scrub_problem "$target" 'Cannot record XFS attempt safely; no scan started.'
+            else
+                print_xfs_scrub_progress "CHECKING $target (check only; timeout ${XFS_SCRUB_TIMEOUT_SECONDS}s)"
+                log="$work_dir/xfs-scrub-output.txt"
+                run_probe "$XFS_SCRUB_TIMEOUT_SECONDS" xfs_scrub -n "$target" </dev/null > "$log" 2>&1
+                rc=$?
+                print_xfs_scrub_progress "FINISHED $target (exit $rc; no repairs requested)"
+                epoch=$now; result=$rc
+                if ! write_xfs_scrub_state "$state" "$epoch" "$result" "$log"; then
+                    xfs_scrub_problem "$target" 'Cannot persist completed XFS result; attempt remains incomplete in state.'
+                    append_filesystem_details "Unsaved XFS check-only output: $target (exit $rc)" "$log"
+                fi
+            fi
+        fi
+        [[ -z $result ]] || report_xfs_scrub_result "$target" "$state" "$epoch" "$result"
+    done < "$local_filesystems_file"
+}
+
 check_deep_scrub_scheduling() {
     local source target fstype options type
     local ext_lvm_found=0 xfs_found=0
@@ -2920,7 +3110,9 @@ check_deep_scrub_scheduling() {
 
     if (( xfs_found )); then
         deep_check_target_count=$((deep_check_target_count + 1))
-        if command -v xfs_scrub_all >/dev/null 2>&1; then
+        if is_enabled "$XFS_SCRUB_AUTO"; then
+            run_scheduled_xfs_scrubs
+        elif command -v xfs_scrub_all >/dev/null 2>&1; then
             check_timer_health 'xfs_scrub_all.timer' 'xfs_scrub_all.service' \
                 'XFS online scrub' 'xfs_scrub_all'
         else
@@ -3724,6 +3916,17 @@ if ! is_nonnegative_integer "$SMART_SHORT_TEST_AGE_DAYS" ||
     exit 64
 fi
 
+if ! [[ $XFS_SCRUB_INTERVAL_DAYS =~ ^[1-9][0-9]{0,3}$ ]] ||
+   (( XFS_SCRUB_INTERVAL_DAYS > 3650 )); then
+    printf '%s: XFS_SCRUB_INTERVAL_DAYS must be an integer from 1 to 3650.\n' "$PROGRAM_NAME" >&2
+    exit 64
+fi
+if ! [[ $XFS_SCRUB_TIMEOUT_SECONDS =~ ^[1-9][0-9]{0,5}$ ]] ||
+   (( XFS_SCRUB_TIMEOUT_SECONDS > 86400 )); then
+    printf '%s: XFS_SCRUB_TIMEOUT_SECONDS must be an integer from 1 to 86400.\n' "$PROGRAM_NAME" >&2
+    exit 64
+fi
+
 for timeout_value in "$SMART_TIMEOUT_SECONDS" "$PROBE_TIMEOUT_SECONDS" \
     "$JOURNAL_TIMEOUT_SECONDS" "$APT_COMMAND_TIMEOUT_SECONDS" \
     "$DEBSUMS_TIMEOUT_SECONDS" "$RPM_VERIFY_TIMEOUT_SECONDS" \
@@ -4434,7 +4637,8 @@ change_message=''
     printf 'explicitly in the kernel-log, filesystem/RAID, or SMART sections above.\n'
     printf 'The audit checks mount state, capacity, boot fsck results, selected RAID and\n'
     printf 'filesystem-native health data, and recorded scrub status. It does not run\n'
-    printf 'fsck, repair filesystems, or start deep scrubs. No online health check can\n'
+    printf 'fsck or repair filesystems. Opt-in XFS scans use xfs_scrub -n only.\n'
+    printf 'No online health check can\n'
     printf 'guarantee every disk, cable, controller, RAID, virtual-storage, or\n'
     printf 'filesystem condition. %s checks package-managed\n' "$PACKAGE_VERIFY_TOOL"
     if [[ $PACKAGE_BACKEND == dpkg ]]; then

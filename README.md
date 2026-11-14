@@ -2,7 +2,7 @@
 
 Linux package-integrity, storage-health, and filesystem auditing, with terminal and optional multipart email reporting.
 
-> **Development preview:** `2.0.0-dev.13` implements both Debian/Ubuntu (`debsums`) and Rocky Linux/RHEL (`rpm`) package-integrity backends. Regression fixtures pass, and live audits have completed on Rocky Linux 9.8 and Ubuntu 24.04. The v2.0.0-dev.11 unattended APT fix passed a live Ubuntu 24.04 `debsums` reinstall and subsequent audit. The v2.0.0-dev.12 installation display passed a live Ubuntu 24.04 reinstall test. Since v2.0.0-dev.13, the installation heading reads `[INSTALLING] missing audit package(s): <packages>` in warning yellow on color-capable terminals; `NO_COLOR` and plain output are respected. **Broader Rocky/RHEL host validation and production certification remain pending**. Do not treat this branch as a certified production release. The existing `debsums-audit` v1.7.1 remains the known-working Ubuntu baseline.
+> **Development preview:** `2.0.0-dev.14` implements both Debian/Ubuntu (`debsums`) and Rocky Linux/RHEL (`rpm`) package-integrity backends. Regression fixtures pass, and live audits have completed on Rocky Linux 9.8 and Ubuntu 24.04. The v2.0.0-dev.11 unattended APT fix passed a live Ubuntu 24.04 `debsums` reinstall and subsequent audit. The v2.0.0-dev.12 installation display passed a live Ubuntu 24.04 reinstall test. Since v2.0.0-dev.13, the installation heading reads `[INSTALLING] missing audit package(s): <packages>` in warning yellow on color-capable terminals; `NO_COLOR` and plain output are respected. **Broader Rocky/RHEL host validation and production certification remain pending**. Do not treat this branch as a certified production release. The existing `debsums-audit` v1.7.1 remains the known-working Ubuntu baseline.
 
 ## Platform support
 
@@ -56,6 +56,30 @@ sudo env SMART_SHORT_TEST_AUTO=0 REPORT_TO=username@email.address FORCE_REPORT=1
 
 See [SMART scheduler notes](docs/smart-short-tests.md) for details and caveats. Starting a non-captive SMART test is designed to allow ongoing disk I/O, but it **can temporarily reduce performance**; test on representative hardware before routine scheduling.
 
+## Periodic check-only XFS scrubbing (v2.0.0-dev.14)
+
+**Opt-in:** `XFS_SCRUB_AUTO=0` by default. To let a recurring audit perform weekly metadata checks:
+
+```bash
+sudo env XFS_SCRUB_AUTO=1 XFS_SCRUB_INTERVAL_DAYS=7 \
+  AUTO_ENABLE_PERSISTENT_JOURNAL=0 SMART_SHORT_TEST_AUTO=0 \
+  REPORT_TO=username@email.address FORCE_REPORT=1 ./system-integrity-audit
+```
+
+Use `XFS_SCRUB_AUTO=1` in the environment of each scheduled audit to keep this behavior enabled. The script does not install a timer or daemon: the first enabled audit checks eligible filesystems immediately, and later audits check again when at least seven days have elapsed since each filesystem's **last attempt**. Failed or interrupted attempts also wait for that interval; they do not cause an expensive scan on every audit.
+
+- Requires `FILESYSTEM_CHECKS_ENABLED=1` and an existing `xfs_scrub` executable. No XFS package is installed or timer enabled by this feature.
+- Runs only `xfs_scrub -n <mountpoint>`, sequentially, with closed stdin. It requests **no repairs or optimizations**, no `xfs_scrub_all` invocation and no file-data/media scan. XFS online scrubbing may still be experimental on your installed version and can consume substantial I/O/CPU resources; keep current backups and choose an appropriate audit window.
+- Defaults to a **3,600-second timeout per filesystem**, configurable with `XFS_SCRUB_TIMEOUT_SECONDS` (1–86,400). Several filesystems can extend an audit by several hours. A timeout is reported as incomplete; it is never described as a successful check.
+- Verifies mounted XFS UUID and filesystem root, deduplicates UUIDs, and skips bind-marked/subdirectory mounts. UUID-based scheduling survives device-path aliases. Filesystems whose identity cannot be verified are skipped with an incomplete-check warning.
+- Starts no new scan if the stock `xfs_scrub_all.timer` is enabled/active, its state is unknown, the stock scrub service is active/starting, or another `xfs_scrub`/`xfs_scrub_all` process is detected. Process detection is checked before each scan. External administrators must still avoid starting other scrub jobs concurrently; this is not a shared lock with external tools. The audit's own singleton lock prevents overlapping audit runs using the same lock file.
+- Stores timestamps, exit results and output in private UUID-named files under `XFS_SCRUB_STATE_DIR` (default `/var/lib/system-integrity-audit/xfs-scrub`). The directory must be owned by the audit user (root in normal runs), mode `0700`; records must be mode `0600`. Symlinks, malformed state and future timestamps fail closed. An attempt is recorded **before** dispatch, so an interrupted audit is reported as incomplete on subsequent runs.
+- Includes the last saved result and sanitized output in later reports, even when another scan is not due. Exit 0 informational optimization/confusable-name messages remain informational. Exit bit 1 reports uncorrected filesystem errors as ALERT; bit 2 alone is NOTICE; operational/usage errors, signals and timeouts mark coverage incomplete. These exit bits apply to `xfs_scrub`, not `xfs_scrub_all`.
+
+`[XFS-SCRUB]` progress shows each check's start and finish in warning yellow, honoring `NO_COLOR` and progress settings. During a scan the filesystem-stage spinner is paused; detailed command output appears in the report. When audit-managed XFS checks are enabled, their results replace the disabled-stock-timer notice. With `XFS_SCRUB_AUTO=0`, the existing timer-inspection behavior is unchanged. Disabling all filesystem checks also disables this scheduler.
+
+A successful metadata check is evidence about filesystem consistency; it does not establish that file contents or storage hardware are healthy. This feature has mock regression coverage; live validation of script-managed scheduling remains pending.
+
 ## Email reporting
 
 Email delivery is available, but disabled by the exact default placeholder:
@@ -81,7 +105,7 @@ AUTO_INSTALL_REQUIREMENTS=1
 AUTO_ENABLE_PERSISTENT_JOURNAL=1
 ```
 
-When run with sufficient privileges, the audit **may install missing prerequisites using APT (Debian/Ubuntu) or DNF (RPM systems)** and **may configure/restart journald to enable persistent kernel logs when necessary**. These are conditional actions: setting `1` does not force a package transaction or journal change when everything is already configured. The audit also creates private lock, temporary, and state files, and the default SMART short-test scheduler may start a non-captive drive self-test under its strict eligibility gates. **Review the script and these side effects before running it as root on a production host.**
+When run with sufficient privileges, the audit **may install missing prerequisites using APT (Debian/Ubuntu) or DNF (RPM systems)** and **may configure/restart journald to enable persistent kernel logs when necessary**. These are conditional actions: setting `1` does not force a package transaction or journal change when everything is already configured. The opt-in XFS scheduler can run bounded check-only metadata scans. The audit also creates private lock, temporary, and state files, and the default SMART short-test scheduler may start a non-captive drive self-test under its strict eligibility gates. **Review the script and these side effects before running it as root on a production host.**
 
 Since v2.0.0-dev.11, automatic APT installation on Debian/Ubuntu runs with noninteractive debconf, standard input from `/dev/null`, dpkg pseudo-terminal disabled, and conservative conffile options. GNU `timeout --foreground` avoids the stopped/background-process-group behavior seen during a live Ubuntu 24.04 `debsums` install. APT output is captured in the audit's temporary log. Since v2.0.0-dev.12, when progress display is enabled (`PROGRESS_OUTPUT=auto` on a terminal, or `always`), the prerequisite spinner stops before installation messages or lock waits, and APT/DNF output streams to standard error while also being logged. The prerequisite result is printed afterward and normal audit progress resumes. With progress disabled, successful installation output stays in the log; failure diagnostics retain their existing behavior. Timeouts fail the installation without automatically starting another package transaction; foreground timeout cannot guarantee termination of all package-maintenance child processes. The unattended APT fix has mock and pseudo-terminal regression coverage and passed a live Ubuntu 24.04 reinstall test; the audit then advanced through prerequisite verification and built its report.
 

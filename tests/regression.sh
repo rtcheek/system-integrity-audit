@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Non-destructive regression fixtures for system-integrity-audit 2.0.0-dev.13.
+# Non-destructive regression fixtures for system-integrity-audit 2.0.0-dev.14.
 # Run: bash tests/regression.sh [path/to/system-integrity-audit]
 set -euo pipefail
 SCRIPT=${1:-"$(dirname "$0")/../system-integrity-audit"}
@@ -42,6 +42,7 @@ STATEFUL_NOTIFICATIONS=1
 NOTIFICATION_REPEAT_DAYS=7
 SMART_EXTENDED_DETAILS=0
 SMART_SHORT_TEST_AUTO=0
+XFS_SCRUB_AUTO=0
 SMART_SHORT_TEST_AGE_DAYS=60
 SMART_SHORT_TEST_STATE_FILE=$test_dir/smart-test-state.tsv
 SMART_CPU_STAT_PATH=$test_dir/procstat
@@ -800,7 +801,7 @@ MOCK_COVERAGE_MODE=normal
 export JOURNAL_TIMEOUT_SECONDS MOCK_COVERAGE_MODE
 pass 'coverage failures, empty history, short retention, and timeout handled safely'
 
-assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.13' 'embedded version'
+assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.14' 'embedded version'
 # Confirm both host-changing features are enabled when not set by the caller,
 # but retain explicit safe opt-outs for all integration/regression fixtures.
 defaults=$(env -u AUTO_INSTALL_REQUIREMENTS -u AUTO_ENABLE_PERSISTENT_JOURNAL \
@@ -865,6 +866,7 @@ sed -i "s@^PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'@P
     "$test_dir/integration.sh"
 rm -f "$test_dir/last-email.eml"
 ENV_ARGS=(
+    "XFS_SCRUB_AUTO=0"
     "MOCK_DIR=$test_dir"
     "AUTO_INSTALL_REQUIREMENTS=0"
     "AUTO_ENABLE_PERSISTENT_JOURNAL=0"
@@ -895,7 +897,7 @@ assert_eq "$rc" 0 'full clean report exit success'
 grep -q 'Subject: .* TEST/OK - ' "$test_dir/last-email.eml" || fail 'clean status subject'
 grep -q '^From: "System Integrity Audit" <system-integrity-audit>' "$test_dir/last-email.eml" || fail 'visible From header'
 grep -q 'Audit coverage' "$test_dir/last-email.eml" || fail 'coverage section missing'
-grep -q 'Script version: *2.0.0-dev.13' "$test_dir/last-email.eml" || fail 'version absent in report'
+grep -q 'Script version: *2.0.0-dev.14' "$test_dir/last-email.eml" || fail 'version absent in report'
 # These labels share a fixed value column (32 characters), in both
 # email text/plain and preformatted HTML. Protect against spacing drift.
 for expected_line in \
@@ -1046,7 +1048,7 @@ pass 'placeholder disables early-failure email'
 
 # RPM distributions are no longer blocked at initialization. A separate
 # regression script validates their full package and reporting lifecycle.
-assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.13' 'v2 development version'
+assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.14' 'v2 development version'
 pass 'RPM backend enabled in development release'
 
 # Probe timeout must return 124, and never silently claim the check succeeded.
@@ -1055,5 +1057,225 @@ rc=$?
 assert_eq "$rc" 124 'bounded probe timeout status'
 grep -q 'TIMEOUT' "$test_dir/timeout-err" || fail 'missing timeout diagnostic'
 pass 'bounded external command execution'
+
+# XFS checks are entirely simulated. No real xfs_scrub or systemctl is run.
+(
+    mkdir -p "$test_dir/xfs-bin"
+    cat > "$test_dir/xfs-bin/xfs_scrub" <<'MOCK'
+#!/usr/bin/env bash
+printf '%s\n' CALL "$@" >> "$MOCK_DIR/xfs-calls"
+[[ $# == 2 && $1 == -n && $2 == /* ]] || exit 99
+uuid=11111111-1111-1111-1111-111111111111
+[[ $2 != /two ]] || uuid=22222222-2222-2222-2222-222222222222
+grep -q $'\tRUNNING$' "$XFS_SCRUB_STATE_DIR/$uuid.state" || exit 97
+if read -r anything; then exit 98; fi
+printf '%s\n' 'EXPERIMENTAL xfs_scrub program in use!' \
+    'Info: AG 1 superblock: Optimization is possible.' \
+    'Info: Unicode name fn._mm_loadl_pd.html could be confused with fn._mm_load1_pd.html.'
+[[ ${MOCK_XFS_MODE:-normal} != timeout ]] || exec sleep 3
+exit "${MOCK_XFS_RC:-0}"
+MOCK
+    cat > "$test_dir/xfs-bin/findmnt" <<'MOCK'
+#!/usr/bin/env bash
+[[ ${MOCK_XFS_IDENTITY:-ok} != bad ]] || exit 1
+uuid=11111111-1111-1111-1111-111111111111
+[[ $3 != /two ]] || uuid=22222222-2222-2222-2222-222222222222
+printf 'xfs %s /\n' "$uuid"
+MOCK
+    cat > "$test_dir/xfs-bin/systemctl" <<'MOCK'
+#!/usr/bin/env bash
+case $1 in
+    is-enabled) echo "${MOCK_XFS_TIMER:-disabled}" ;;
+    is-active)
+        if [[ $2 == xfs_scrub_all.service ]]; then
+            echo "${MOCK_XFS_SERVICE_ACTIVE:-inactive}"
+        else
+            echo "${MOCK_XFS_TIMER_ACTIVE:-inactive}"
+        fi
+        ;;
+    show) echo "${MOCK_XFS_LOAD_STATE:-loaded}" ;;
+    *) exit 1 ;;
+esac
+MOCK
+    cat > "$test_dir/xfs-bin/pgrep" <<'MOCK'
+#!/usr/bin/env bash
+exit "${MOCK_XFS_BUSY:-1}"
+MOCK
+    chmod +x "$test_dir/xfs-bin/"*
+    PATH="$test_dir/xfs-bin:$PATH"
+    export PATH
+    export MOCK_XFS_RC=0 MOCK_XFS_BUSY=1 MOCK_XFS_TIMER=disabled
+    export MOCK_XFS_MODE=normal MOCK_XFS_IDENTITY=ok MOCK_XFS_TIMER_ACTIVE=inactive
+    XFS_SCRUB_AUTO=1
+    XFS_SCRUB_INTERVAL_DAYS=7
+    XFS_SCRUB_TIMEOUT_SECONDS=5
+    export XFS_SCRUB_STATE_DIR="$test_dir/xfs-state"
+    PROGRESS_OUTPUT=never
+    state_a="$XFS_SCRUB_STATE_DIR/11111111-1111-1111-1111-111111111111.state"
+    single_mount() { printf '/dev/a\t/one space\txfs\trw\n' > "$local_filesystems_file"; }
+    reset_xfs_findings() {
+        : > "$filesystem_findings_file"
+        : > "$filesystem_details_file"
+        filesystem_alert_count=0
+        filesystem_warning_count=0
+        filesystem_notice_count=0
+        filesystem_check_error_count=0
+    }
+    reset_xfs() {
+        rm -rf -- "$XFS_SCRUB_STATE_DIR"
+        : > "$test_dir/xfs-calls"
+        reset_xfs_findings
+        single_mount
+    }
+    reset_xfs
+    XFS_SCRUB_AUTO=0 run_scheduled_xfs_scrubs
+    [[ ! -e $XFS_SCRUB_STATE_DIR && ! -s $test_dir/xfs-calls ]] || fail 'XFS opt-out wrote state or ran a scan'
+    pass 'XFS scheduler is opt-in and disabled path performs no scan or state writes'
+
+    printf '/dev/a\t/duplicate\txfs\trw\n/dev/b\t/two\txfs\trw\n/dev/a\t/bind\txfs\trw,bind\n' >> "$local_filesystems_file"
+    deep_check_target_count=0
+    check_deep_scrub_scheduling
+    grep -q 'DEEP-CHECK.*xfs_scrub_all' "$filesystem_findings_file" && fail 'audit-managed XFS checks retained disabled stock-timer notice'
+    assert_eq "$(grep -c '^CALL$' "$test_dir/xfs-calls")" 2 'XFS UUID deduplication'
+    assert_eq "$filesystem_alert_count:$filesystem_warning_count:$filesystem_check_error_count" '0:0:0' 'XFS informational messages must not become warnings or alerts'
+    grep -q 'could be confused' "$filesystem_details_file" || fail 'XFS informational output missing from report'
+    assert_eq "$(stat -c %a "$XFS_SCRUB_STATE_DIR")" 700 'XFS state directory permissions'
+    assert_eq "$(stat -c %a "$state_a")" 600 'XFS record permissions'
+    pass 'XFS runs check-only with closed stdin, deduplicates UUIDs, skips binds and retains informational output'
+
+    reset_xfs_findings
+    run_scheduled_xfs_scrubs
+    assert_eq "$(grep -c '^CALL$' "$test_dir/xfs-calls")" 2 'weekly XFS checks must not repeat on next audit'
+    grep -q 'could be confused' "$filesystem_details_file" || fail 'cached XFS output absent'
+    old_epoch=$(( $(date +%s) - 8 * 86400 ))
+    for state in "$XFS_SCRUB_STATE_DIR/"*.state; do
+        sed -i "1s/^[0-9]*/$old_epoch/" "$state"
+    done
+    run_scheduled_xfs_scrubs
+    assert_eq "$(grep -c '^CALL$' "$test_dir/xfs-calls")" 4 'XFS checks must run again after interval'
+    pass 'XFS weekly interval persists across audits and retained output remains visible'
+
+    for status in 1 2 3 4 8 16 124 137; do
+        reset_xfs
+        MOCK_XFS_RC=$status run_scheduled_xfs_scrubs
+        case $status in
+            1|3) (( filesystem_alert_count == 1 )) || fail 'XFS corruption exit bit must alert' ;;
+            2) assert_eq "$filesystem_warning_count:$filesystem_alert_count" '0:0' 'XFS optimization exit is informational' ;;
+            *) (( filesystem_check_error_count == 1 && filesystem_alert_count == 0 )) || fail 'XFS operational failure/timeout must be incomplete, not corruption' ;;
+        esac
+        before="$filesystem_alert_count:$filesystem_warning_count:$filesystem_check_error_count"
+        reset_xfs_findings
+        run_scheduled_xfs_scrubs
+        assert_eq "$filesystem_alert_count:$filesystem_warning_count:$filesystem_check_error_count" "$before" 'cached XFS error classification'
+        assert_eq "$(grep -c '^CALL$' "$test_dir/xfs-calls")" 1 'failed XFS attempt must not immediately repeat'
+    done
+    pass 'XFS error, optimization, operational and timeout statuses retain their meaning between audits'
+
+    reset_xfs
+    MOCK_XFS_MODE=timeout XFS_SCRUB_TIMEOUT_SECONDS=1 run_scheduled_xfs_scrubs
+    grep -q $'\t124$' "$state_a" || fail 'XFS real timeout result not saved'
+    (( filesystem_check_error_count == 1 )) || fail 'XFS timeout coverage must be incomplete'
+    pass 'XFS scan is time bounded and timeout is persisted'
+
+    reset_xfs
+    MOCK_XFS_TIMER=enabled run_scheduled_xfs_scrubs
+    [[ ! -s $test_dir/xfs-calls ]] || fail 'XFS scan overlapped enabled stock timer'
+    MOCK_XFS_TIMER_ACTIVE=active run_scheduled_xfs_scrubs
+    [[ ! -s $test_dir/xfs-calls ]] || fail 'XFS scan overlapped active stock timer'
+    MOCK_XFS_TIMER=unknown run_scheduled_xfs_scrubs
+    [[ ! -s $test_dir/xfs-calls ]] || fail 'XFS scan ignored unknown timer state'
+    MOCK_XFS_BUSY=0 run_scheduled_xfs_scrubs
+    [[ ! -s $test_dir/xfs-calls ]] || fail 'XFS scan overlapped another scrub process'
+    reset_xfs_findings
+    MOCK_XFS_BUSY=2 run_scheduled_xfs_scrubs
+    (( filesystem_check_error_count == 1 )) || fail 'XFS process detection error not reported'
+    MOCK_XFS_SERVICE_ACTIVE=activating run_scheduled_xfs_scrubs
+    [[ ! -s $test_dir/xfs-calls ]] || fail 'XFS scan overlapped starting stock service'
+    pass 'XFS scheduler avoids stock timers and running scrubs, and fails closed on unknown state'
+
+    reset_xfs
+    MOCK_XFS_LOAD_STATE=not-found MOCK_XFS_TIMER='' MOCK_XFS_TIMER_ACTIVE=inactive \
+        run_scheduled_xfs_scrubs
+    assert_eq "$(grep -c '^CALL$' "$test_dir/xfs-calls")" 1 'verified absent stock timer should allow check-only scrub'
+    pass 'XFS scheduler permits a verified absent stock timer'
+
+
+    reset_xfs
+    MOCK_XFS_IDENTITY=bad run_scheduled_xfs_scrubs
+    [[ ! -s $test_dir/xfs-calls ]] || fail 'XFS scan ran without verified UUID'
+    (( filesystem_check_error_count == 1 )) || fail 'XFS unknown identity not reported'
+    pass 'XFS scheduler refuses unverifiable filesystem identity'
+
+    reset_xfs
+    mkdir -m 700 "$XFS_SCRUB_STATE_DIR"
+    printf '%s\tRUNNING\n' "$(date +%s)" > "$state_a"
+    run_scheduled_xfs_scrubs
+    [[ ! -s $test_dir/xfs-calls ]] || fail 'XFS interrupted attempt retried immediately'
+    (( filesystem_check_error_count == 1 )) || fail 'XFS interrupted attempt not reported'
+    reset_xfs_findings
+    printf '%s\t0\n' "$(( $(date +%s) + 86400 ))" > "$state_a"
+    run_scheduled_xfs_scrubs
+    [[ ! -s $test_dir/xfs-calls ]] || fail 'XFS future timestamp caused scan'
+    (( filesystem_check_error_count == 1 )) || fail 'XFS future timestamp not reported'
+    printf 'garbage\n' > "$state_a"
+    run_scheduled_xfs_scrubs
+    [[ ! -s $test_dir/xfs-calls ]] || fail 'XFS malformed state caused scan'
+    pass 'XFS interrupted, future and malformed state fails closed'
+
+    reset_xfs
+    mkdir "$test_dir/xfs-outside"
+    printf 'sentinel\n' > "$test_dir/xfs-outside/sentinel"
+    ln -s "$test_dir/xfs-outside" "$XFS_SCRUB_STATE_DIR"
+    run_scheduled_xfs_scrubs
+    [[ ! -s $test_dir/xfs-calls ]] || fail 'XFS symlinked directory accepted'
+    rm "$XFS_SCRUB_STATE_DIR"
+    mkdir -m 700 "$XFS_SCRUB_STATE_DIR"
+    ln -s "$test_dir/xfs-outside/sentinel" "$state_a"
+    run_scheduled_xfs_scrubs
+    assert_eq "$(cat "$test_dir/xfs-outside/sentinel")" sentinel 'XFS symlink target overwritten'
+    [[ ! -s $test_dir/xfs-calls ]] || fail 'XFS symlinked record accepted'
+    rm "$state_a"
+    chmod 755 "$XFS_SCRUB_STATE_DIR"
+    run_scheduled_xfs_scrubs
+    [[ ! -s $test_dir/xfs-calls ]] || fail 'XFS nonprivate directory accepted'
+    pass 'XFS scheduler rejects symlinked and nonprivate state without overwriting targets'
+
+    reset_xfs
+    MOCK_XFS_RC=1 run_scheduled_xfs_scrubs
+    reset_xfs_findings
+    MOCK_XFS_TIMER=enabled run_scheduled_xfs_scrubs
+    (( filesystem_alert_count == 1 )) || fail 'enabled stock timer hid cached XFS corruption'
+    pass 'XFS cached corruption remains visible when external scheduling blocks new checks'
+
+    reset_xfs
+    (
+        command() {
+            [[ ${1:-}:${2:-} != -v:xfs_scrub ]] || return 1
+            builtin command "$@"
+        }
+        run_scheduled_xfs_scrubs
+        [[ ! -s $test_dir/xfs-calls ]] || fail 'XFS scan ran without required tool'
+        (( filesystem_check_error_count == 1 )) || fail 'XFS missing tool not reported'
+    ) || fail 'missing XFS tool fixture'
+    (
+        write_xfs_scrub_state() { return 1; }
+        run_scheduled_xfs_scrubs
+        [[ ! -s $test_dir/xfs-calls ]] || fail 'XFS scan started before durable attempt record'
+        (( filesystem_check_error_count == 1 )) || fail 'XFS state write failure not reported'
+    ) || fail 'XFS state-write fixture'
+    pass 'XFS missing tools and failed attempt recording prevent dispatch'
+
+    reset_xfs
+    (
+        command() {
+            [[ ${1:-}:${2:-} != -v:xfs_scrub_all ]] || return 0
+            builtin command "$@"
+        }
+        XFS_SCRUB_AUTO=0 check_deep_scrub_scheduling
+        grep -q 'DEEP-CHECK.*xfs_scrub_all.*disabled' "$filesystem_findings_file" || fail 'disabled XFS scheduler lost original timer notice'
+        [[ ! -e $XFS_SCRUB_STATE_DIR && ! -s $test_dir/xfs-calls ]] || fail 'disabled scheduler wrote state or dispatched a scan'
+    ) || fail 'disabled XFS timer-inspection fixture'
+    pass 'XFS disabled scheduler preserves stock timer inspection without scans'
+) || fail 'XFS scheduler regression group'
 
 echo 'All regression tests passed.'
