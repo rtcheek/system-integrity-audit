@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Non-destructive regression fixtures for system-integrity-audit 2.0.0-dev.11.
+# Non-destructive regression fixtures for system-integrity-audit 2.0.0-dev.12.
 # Run: bash tests/regression.sh [path/to/system-integrity-audit]
 set -euo pipefail
 SCRIPT=${1:-"$(dirname "$0")/../system-integrity-audit"}
@@ -93,6 +93,31 @@ case "${MOCK_APT_MODE:-success}" in
             exit 100
         fi
         ;;
+    live)
+        if [[ -n ${MOCK_SPINNER_PID:-} ]] && kill -0 "$MOCK_SPINNER_PID" 2>/dev/null; then
+            echo 'spinner still running during install' >&2
+            exit 89
+        fi
+        echo 'APT live stdout'
+        echo 'APT live stderr' >&2
+        # The observer file is stderr of the audit, not the captured log.
+        # Require output to arrive before this command finishes.
+        for ((i=0; i<50; i++)); do
+            if grep -q 'APT live stderr' "$MOCK_DIR/live-install.stderr"; then
+                : > "$MOCK_DIR/live-output-seen"
+                break
+            fi
+            sleep 0.02
+        done
+        [[ -e $MOCK_DIR/live-output-seen ]] || exit 90
+        : > "$MOCK_DIR/debsums-installed"
+        ;;
+    inherited_output)
+        sleep 10 &
+        echo "$!" > "$MOCK_DIR/package-hook.pid"
+        echo 'hook launched'
+        wait
+        ;;
     timeout) exec sleep 3 ;;
 esac
 echo 'simulated APT success'
@@ -151,6 +176,8 @@ export PATH
 apt_output_file="$MOCK_DIR/apt-pty-output.txt"
 APT_COMMAND_TIMEOUT_SECONDS=5
 export MOCK_APT_MODE=foreground
+PROGRESS_OUTPUT=always
+progress_start 'Checking audit prerequisites'
 run_apt_get_with_retries 'PTY process-group check' -q -y install debsums
 EOF
     chmod +x "$test_dir/apt-pty-fixture.sh"
@@ -165,6 +192,118 @@ EOF
 else
     echo 'SKIP: PTY APT job-control fixture (script command unavailable)'
 fi
+
+
+# Exercise the actual prerequisite stage with a spinner and streamed output.
+# Everything is mocked, including the command-availability change on install.
+(
+    PROGRESS_OUTPUT=always
+    PACKAGE_BACKEND=dpkg
+    SMART_CHECK_ENABLED=0
+    AUTO_INSTALL_REQUIREMENTS=1
+    automatic_change_count=0
+    automatic_notice_count=0
+    command() {
+        if [[ ${1:-} == -v && ${2:-} == debsums ]]; then
+            [[ -e $test_dir/debsums-installed ]]
+        else
+            builtin command "$@"
+        fi
+    }
+    logger() { :; }
+    wait_for_package_manager_idle() {
+        [[ -z ${progress_spinner_pid:-} ]] || return 91
+    }
+    progress_start 'Checking audit prerequisites'
+    export MOCK_SPINNER_PID=$progress_spinner_pid
+    export MOCK_APT_MODE=live
+    install_missing_audit_tools
+    rc=$?
+    [[ -z ${progress_spinner_pid:-} ]] || exit 92
+    assert_eq "$automatic_change_count" 1 'installation recorded'
+    progress_finish notice
+    progress_start 'Verifying audit commands'
+    progress_finish done
+    exit "$rc"
+) > "$test_dir/live-install.stdout" 2> "$test_dir/live-install.stderr"
+assert_eq "$?" 0 'live prerequisite install and spinner suspension'
+[[ ! -s $test_dir/live-install.stdout ]] || fail 'install progress polluted report stdout'
+for line in 'APT live stdout' 'APT live stderr'; do
+    grep -Fxq "$line" "$apt_output_file" || fail 'live output not retained in log'
+    assert_eq "$(grep -c "^$line$" "$test_dir/live-install.stderr")" 1 'live output shown once'
+done
+grep -q 'NOTICE.*Checking audit prerequisites' "$test_dir/live-install.stderr" || fail 'stage label lost'
+grep -q 'OK.*Verifying audit commands' "$test_dir/live-install.stderr" || fail 'progress did not resume'
+pass 'prerequisite spinner pauses before install, streams output live and resumes stages'
+
+# Streaming must not turn a timeout into success or a retry.
+: > "$test_dir/apt-invocations"
+PROGRESS_OUTPUT=always APT_COMMAND_TIMEOUT_SECONDS=1 MOCK_APT_MODE=timeout \
+    run_apt_install_with_refresh debsums > "$test_dir/live-timeout.stdout" 2> "$test_dir/live-timeout.stderr"
+assert_eq "$?" 124 'streamed APT timeout status preserved'
+assert_eq "$(grep -c '^--CALL--$' "$test_dir/apt-invocations")" 1 'streamed timeout must not retry'
+assert_eq "$(grep -c 'TIMEOUT: apt-get' "$test_dir/live-timeout.stderr")" 1 'timeout log not replayed twice'
+pass 'streamed APT timeout preserves status and does not retry or duplicate diagnostics'
+
+# A hook can survive timeout --foreground and retain stdout/stderr. Use an
+# outer watchdog so a display implementation that waits for pipe EOF fails.
+(
+    PROGRESS_OUTPUT=always
+    APT_COMMAND_TIMEOUT_SECONDS=1
+    export MOCK_APT_MODE=inherited_output
+    run_apt_install_with_refresh debsums
+    rc=$?
+    echo "$rc" > "$test_dir/inherited-output.exit"
+) > "$test_dir/inherited-output.stdout" 2> "$test_dir/inherited-output.stderr" &
+fixture_pid=$!
+for ((i=0; i<60; i++)); do
+    [[ -e $test_dir/inherited-output.exit ]] && break
+    sleep 0.05
+done
+if [[ ! -e $test_dir/inherited-output.exit ]]; then
+    [[ ! -f $test_dir/package-hook.pid ]] || kill "$(cat "$test_dir/package-hook.pid")" 2>/dev/null
+    wait "$fixture_pid" 2>/dev/null
+    fail 'live display waited for surviving package hook after APT timeout'
+fi
+[[ ! -f $test_dir/package-hook.pid ]] || kill "$(cat "$test_dir/package-hook.pid")" 2>/dev/null
+wait "$fixture_pid"
+assert_eq "$(cat "$test_dir/inherited-output.exit")" 124 'hook-retained output timeout status'
+grep -q 'hook launched' "$test_dir/inherited-output.stderr" || fail 'hook output absent'
+pass 'live APT display returns on timeout even while a hook retains output'
+
+# Quiet successful installs stay quiet while retaining their full log.
+PROGRESS_OUTPUT=never MOCK_APT_MODE=success run_apt_install_with_refresh debsums \
+    > "$test_dir/quiet-install.stdout" 2> "$test_dir/quiet-install.stderr"
+assert_eq "$?" 0 'quiet APT installation status'
+[[ ! -s $test_dir/quiet-install.stdout && ! -s $test_dir/quiet-install.stderr ]] || fail 'quiet install leaked progress'
+grep -q 'simulated APT success' "$apt_output_file" || fail 'quiet install log absent'
+pass 'quiet APT installation retains logging without terminal output'
+
+# RPM installs use the same display helper; preserve both success and failure.
+cat > "$test_dir/bin/dnf" <<'EOF'
+#!/usr/bin/env bash
+echo 'DNF stdout'
+echo 'DNF stderr' >&2
+exit "${MOCK_DNF_RC:-0}"
+EOF
+chmod +x "$test_dir/bin/dnf"
+for display in never always; do
+    for status in 0 42; do
+        PROGRESS_OUTPUT=$display MOCK_DNF_RC=$status DNF_COMMAND_TIMEOUT_SECONDS=5 \
+            run_dnf_install smartmontools > "$test_dir/dnf.stdout" 2> "$test_dir/dnf.stderr"
+        assert_eq "$?" "$status" 'DNF install status preserved'
+        [[ ! -s $test_dir/dnf.stdout ]] || fail 'DNF output polluted report stdout'
+        grep -Fxq 'DNF stdout' "$apt_output_file" || fail 'DNF stdout not logged'
+        grep -Fxq 'DNF stderr' "$apt_output_file" || fail 'DNF stderr not logged'
+        if [[ $display == never && $status == 0 ]]; then
+            [[ ! -s $test_dir/dnf.stderr ]] || fail 'quiet DNF success leaked output'
+        else
+            assert_eq "$(grep -c '^DNF stdout$' "$test_dir/dnf.stderr")" 1 'DNF stdout displayed once'
+            assert_eq "$(grep -c '^DNF stderr$' "$test_dir/dnf.stderr")" 1 'DNF stderr displayed once'
+        fi
+    done
+done
+pass 'DNF live and quiet installation output retains status and avoids duplicate logs'
 
 reset_fs() {
     : > "$filesystem_findings_file"
@@ -661,7 +800,7 @@ MOCK_COVERAGE_MODE=normal
 export JOURNAL_TIMEOUT_SECONDS MOCK_COVERAGE_MODE
 pass 'coverage failures, empty history, short retention, and timeout handled safely'
 
-assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.11' 'embedded version'
+assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.12' 'embedded version'
 # Confirm both host-changing features are enabled when not set by the caller,
 # but retain explicit safe opt-outs for all integration/regression fixtures.
 defaults=$(env -u AUTO_INSTALL_REQUIREMENTS -u AUTO_ENABLE_PERSISTENT_JOURNAL \
@@ -756,7 +895,7 @@ assert_eq "$rc" 0 'full clean report exit success'
 grep -q 'Subject: .* TEST/OK - ' "$test_dir/last-email.eml" || fail 'clean status subject'
 grep -q '^From: "System Integrity Audit" <system-integrity-audit>' "$test_dir/last-email.eml" || fail 'visible From header'
 grep -q 'Audit coverage' "$test_dir/last-email.eml" || fail 'coverage section missing'
-grep -q 'Script version: *2.0.0-dev.11' "$test_dir/last-email.eml" || fail 'version absent in report'
+grep -q 'Script version: *2.0.0-dev.12' "$test_dir/last-email.eml" || fail 'version absent in report'
 # These labels share a fixed value column (32 characters), in both
 # email text/plain and preformatted HTML. Protect against spacing drift.
 for expected_line in \
@@ -907,7 +1046,7 @@ pass 'placeholder disables early-failure email'
 
 # RPM distributions are no longer blocked at initialization. A separate
 # regression script validates their full package and reporting lifecycle.
-assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.11' 'v2 development version'
+assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.0-dev.12' 'v2 development version'
 pass 'RPM backend enabled in development release'
 
 # Probe timeout must return 124, and never silently claim the check succeeded.
@@ -918,4 +1057,3 @@ grep -q 'TIMEOUT' "$test_dir/timeout-err" || fail 'missing timeout diagnostic'
 pass 'bounded external command execution'
 
 echo 'All regression tests passed.'
-

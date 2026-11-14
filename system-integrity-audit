@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# system-integrity-audit version 2.0.0-dev.11
+# system-integrity-audit version 2.0.0-dev.12
 # DEVELOPMENT PREVIEW: Debian/Ubuntu and Rocky/RHEL RPM backends.
 # Audit kernel/storage health and native package-managed file integrity.
 
@@ -12,10 +12,14 @@ export PATH
 export LC_ALL=C
 
 PROGRAM_NAME='system-integrity-audit'
-PROGRAM_VERSION='2.0.0-dev.11'
+PROGRAM_VERSION='2.0.0-dev.12'
 readonly PROGRAM_NAME PROGRAM_VERSION
 
 # Changelog:
+#   2.0.0-dev.12 (2026-11-13): Pause prerequisite spinner before package
+#                           installation and stream package-manager output
+#                           when progress is enabled; retain quiet logging
+#                           and original transaction exit/timeout status.
 #   2.0.0-dev.11 (2026-11-13): Run APT unattended with noninteractive
 #                           debconf, no stdin/PTY prompts, conservative
 #                           conffile handling and foreground timeout job
@@ -693,6 +697,7 @@ print_startup_banner() {
 
 cleanup() {
     progress_stop
+    stop_install_output
     if [[ -n ${work_dir:-} && -d ${work_dir:-} ]]; then
         rm -rf -- "$work_dir"
     fi
@@ -805,6 +810,41 @@ run_apt_probe() {
     return "$rc"
 }
 
+# The follower watches a private guard process, not package children. Once
+# the command returns, stopping that guard makes tail drain the file and exit
+# even if a package hook still holds the log open after a timeout.
+stop_install_output() {
+    if [[ -n ${install_output_guard_pid:-} ]]; then
+        kill "$install_output_guard_pid" 2>/dev/null || true
+        wait "$install_output_guard_pid" 2>/dev/null || true
+        install_output_guard_pid=''
+    fi
+    if [[ -n ${install_output_follower_pid:-} ]]; then
+        wait "$install_output_follower_pid" 2>/dev/null || true
+        install_output_follower_pid=''
+    fi
+}
+
+# Keep the package command itself in the foreground, writing to a regular
+# log file. A pipe/tee would wait for hooks that inherit stdout after timeout.
+run_install_command() {
+    local rc
+    if progress_output_enabled; then
+        progress_stop
+        : > "$apt_output_file"
+        sleep infinity </dev/null >/dev/null 2>&1 &
+        install_output_guard_pid=$!
+        tail -n +1 -f --sleep-interval=0.1 --pid="$install_output_guard_pid" \
+            "$apt_output_file" </dev/null >&2 &
+        install_output_follower_pid=$!
+        "$@" >"$apt_output_file" 2>&1
+        rc=$?
+        stop_install_output
+        return "$rc"
+    fi
+    "$@" >"$apt_output_file" 2>&1
+}
+
 run_apt_get_with_retries() {
     local operation_name=$1
     shift
@@ -813,7 +853,7 @@ run_apt_get_with_retries() {
 
     while :; do
         : > "$apt_output_file"
-        run_apt_probe "$APT_COMMAND_TIMEOUT_SECONDS" "$@" >"$apt_output_file" 2>&1
+        run_install_command run_apt_probe "$APT_COMMAND_TIMEOUT_SECONDS" "$@"
         rc=$?
 
         if (( rc == 0 )); then
@@ -823,7 +863,7 @@ run_apt_get_with_retries() {
         if (( rc == 124 || rc == 137 )); then
             printf '%s: APT timed out during %s; not retrying while package hooks may still run.\n' \
                 "$PROGRAM_NAME" "$operation_name" >&2
-            cat "$apt_output_file" >&2
+            progress_output_enabled || cat "$apt_output_file" >&2
             return "$rc"
         fi
 
@@ -834,7 +874,7 @@ run_apt_get_with_retries() {
         if (( attempt >= APT_LOCK_RETRY_COUNT )); then
             printf '%s: APT remained locked after %s retries during %s; giving up.\n' \
                 "$PROGRAM_NAME" "$APT_LOCK_RETRY_COUNT" "$operation_name" >&2
-            cat "$apt_output_file" >&2
+            progress_output_enabled || cat "$apt_output_file" >&2
             return 75
         fi
 
@@ -870,12 +910,11 @@ run_dnf_install() {
     local rc
     # DNF performs its own transaction locking. A bounded invocation prevents
     # a stuck repository/network request from blocking the whole audit.
-    run_probe "$DNF_COMMAND_TIMEOUT_SECONDS" dnf -y install "$@" \
-        >"$apt_output_file" 2>&1
+    run_install_command run_probe "$DNF_COMMAND_TIMEOUT_SECONDS" dnf -y install "$@"
     rc=$?
     if (( rc != 0 )); then
         printf '%s: DNF installation failed (exit %s):\n' "$PROGRAM_NAME" "$rc" >&2
-        cat "$apt_output_file" >&2
+        progress_output_enabled || cat "$apt_output_file" >&2
     fi
     return "$rc"
 }
@@ -897,6 +936,10 @@ install_missing_audit_tools() {
     if (( ${#packages[@]} == 0 )); then
         return 0
     fi
+
+    # Clear and reap the spinner before any missing-tool, lock-wait or
+    # installation messages. Keep the stage label for its final status line.
+    progress_stop
 
     if ! is_enabled "$AUTO_INSTALL_REQUIREMENTS"; then
         print_missing_commands "${missing_commands[@]}"
@@ -3690,7 +3733,7 @@ fi
 
 core_commands=(
     cat date dirname flock grep head hostname logger lslocks mkdir mktemp
-    paste rm sed sleep sort uname wc timeout sha256sum mv chmod cp
+    paste rm sed sleep sort uname wc timeout sha256sum mv chmod cp tail
 )
 if [[ $PACKAGE_BACKEND == rpm ]]; then
     core_commands+=(rpm)
