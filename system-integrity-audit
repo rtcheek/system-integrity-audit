@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# system-integrity-audit version 2.0.0-dev.12
+# system-integrity-audit version 2.0.0-dev.13
 # DEVELOPMENT PREVIEW: Debian/Ubuntu and Rocky/RHEL RPM backends.
 # Audit kernel/storage health and native package-managed file integrity.
 
@@ -12,10 +12,13 @@ export PATH
 export LC_ALL=C
 
 PROGRAM_NAME='system-integrity-audit'
-PROGRAM_VERSION='2.0.0-dev.12'
+PROGRAM_VERSION='2.0.0-dev.13'
 readonly PROGRAM_NAME PROGRAM_VERSION
 
 # Changelog:
+#   2.0.0-dev.13 (2026-11-13): Label prerequisite installation with
+#                           warning-yellow [INSTALLING] progress; honor
+#                           NO_COLOR and plain/disabled progress output.
 #   2.0.0-dev.12 (2026-11-13): Pause prerequisite spinner before package
 #                           installation and stream package-manager output
 #                           when progress is enabled; retain quiet logging
@@ -921,6 +924,7 @@ run_dnf_install() {
 
 install_missing_audit_tools() {
     local -a packages=() missing_commands=()
+    local color_reset='' color_bold='' color_yellow=''
 
     if [[ $PACKAGE_BACKEND == dpkg ]] && ! command -v debsums >/dev/null 2>&1; then
         packages+=(debsums)
@@ -954,8 +958,14 @@ install_missing_audit_tools() {
 
     wait_for_package_manager_idle 'automatic prerequisite installation' || return $?
 
-    printf '%s: installing missing audit package(s): %s\n' \
-        "$PROGRAM_NAME" "${packages[*]}" >&2
+    if progress_output_enabled && progress_color_enabled; then
+        color_reset=$'\033[0m'
+        color_bold=$'\033[1m'
+        color_yellow=$'\033[33m'
+    fi
+    printf '%s%s[INSTALLING]%s %smissing audit package(s): %s%s\n' \
+        "$color_bold" "$color_yellow" "$color_reset" \
+        "$color_yellow" "${packages[*]}" "$color_reset" >&2
     logger -p user.notice -t "$PROGRAM_NAME" \
         "Installing missing audit package(s): ${packages[*]}"
 

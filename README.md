@@ -2,7 +2,7 @@
 
 Linux package-integrity, storage-health, and filesystem auditing, with terminal and optional multipart email reporting.
 
-> **Development preview:** `2.0.0-dev.12` implements both Debian/Ubuntu (`debsums`) and Rocky Linux/RHEL (`rpm`) package-integrity backends. Regression fixtures pass, and live audits have completed on Rocky Linux 9.8 and Ubuntu 24.04. The v2.0.0-dev.11 unattended APT fix passed a live Ubuntu 24.04 `debsums` reinstall and subsequent audit. The v2.0.0-dev.12 installation display change has regression coverage; live display confirmation remains pending. **Broader Rocky/RHEL host validation and production certification remain pending**. Do not treat this branch as a certified production release. The existing `debsums-audit` v1.7.1 remains the known-working Ubuntu baseline.
+> **Development preview:** `2.0.0-dev.13` implements both Debian/Ubuntu (`debsums`) and Rocky Linux/RHEL (`rpm`) package-integrity backends. Regression fixtures pass, and live audits have completed on Rocky Linux 9.8 and Ubuntu 24.04. The v2.0.0-dev.11 unattended APT fix passed a live Ubuntu 24.04 `debsums` reinstall and subsequent audit. The v2.0.0-dev.12 installation display passed a live Ubuntu 24.04 reinstall test. Since v2.0.0-dev.13, the installation heading reads `[INSTALLING] missing audit package(s): <packages>` in warning yellow on color-capable terminals; `NO_COLOR` and plain output are respected. **Broader Rocky/RHEL host validation and production certification remain pending**. Do not treat this branch as a certified production release. The existing `debsums-audit` v1.7.1 remains the known-working Ubuntu baseline.
 
 ## Platform support
 
