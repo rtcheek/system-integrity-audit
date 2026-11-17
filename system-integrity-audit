@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# system-integrity-audit version 2.0.3
+# system-integrity-audit version 2.0.4
 # Debian/Ubuntu and Rocky/RHEL RPM backends.
 # Audit kernel/storage health and native package-managed file integrity.
 
@@ -12,10 +12,13 @@ export PATH
 export LC_ALL=C
 
 PROGRAM_NAME='system-integrity-audit'
-PROGRAM_VERSION='2.0.3'
+PROGRAM_VERSION='2.0.4'
 readonly PROGRAM_NAME PROGRAM_VERSION
 
 # Changelog:
+#   2.0.4 (2026-11-17): Scope NVMe history parsing to the self-test log
+#                       and its table header, excluding numbered power
+#                       states and LBA formats from result classification.
 #   2.0.3 (2026-11-16): Support native NVMe controller short self-tests
 #                       with capability/history checks, controller-level
 #                       deduplication and the existing quiet-host gates.
@@ -1848,12 +1851,36 @@ smart_nvme_test_warning() {
         "$(sanitize_text "${model:-Unknown NVMe model}")" "$(sanitize_text "$detail")" >> "$smart_summary_file"
 }
 
+# smartctl -c also prints numbered power-state/LBA tables. Only self-test
+# rows following the self-test table header are eligible for interpretation.
+# Stop at the section boundary and reject duplicate or malformed log headers.
+smart_nvme_selftest_section() {
+    awk '
+        /^Self-test Log \(NVMe Log 0x06(, NSID 0x[[:xdigit:]]+)?\)[[:space:]]*$/ {
+            headers++; inside=1; table=0; print; next
+        }
+        !inside { next }
+        /^[[:space:]]*$/ { inside=0; next }
+        /^Self-test status:/ { statuses++; print; next }
+        /^[[:space:]]*Num[[:space:]]+Test_Description[[:space:]]+Status[[:space:]]+Power_on_Hours([[:space:]]|$)/ {
+            tables++; table=1; print; next
+        }
+        /^No Self-tests Logged[[:space:]]*$/ { print; next }
+        /^[[:space:]]*[0-9]+[[:space:]]/ {
+            if (!table || seen[$1+0]++) malformed=1
+            print; next
+        }
+        { inside=0 }
+        END { if (headers != 1 || statuses != 1 || tables > 1 || malformed) exit 1 }
+    ' "$1"
+}
+
 # NVMe self-tests are controller-wide when addressed with broadcast NSID.
 # Do not reuse ATA status fields, 16-bit lifetime-hour wrap, or namespace keys.
 maybe_start_nvme_short_test() {
     local device=$1 display=$2 controller history_file rc version_major version_minor
     local serial model device_key now last_epoch latest_line previous_note
-    local hours_raw hours_current hours_logged age_hours line recheck_latest
+    local hours_raw hours_current hours_logged age_hours line recheck_latest selftest_file extract_rc
     if [[ $device =~ ^/dev/(nvme[0-9]+)(n[0-9]+)?$ ]]; then
         controller="/dev/${BASH_REMATCH[1]}"
     else
@@ -1904,15 +1931,20 @@ maybe_start_nvme_short_test() {
         smart_short_test_note SKIPPED "$display" "NVMe controller health or self-test history not OK/readable (exit $rc)"
         return 0
     fi
-    if ! grep -Eq '^Self-test Log \(NVMe Log 0x06' "$history_file" ||
-       ! grep -Eq '^Self-test status:[[:space:]]*No self-test in progress[[:space:]]*$' "$history_file"; then
+    selftest_file="$history_file.log"
+    if ! smart_nvme_selftest_section "$history_file" > "$selftest_file"; then
+        smart_short_test_note SKIPPED "$display" 'NVMe self-test log section is missing, duplicated or malformed'
+        return 0
+    fi
+    if ! grep -Eq '^Self-test Log \(NVMe Log 0x06' "$selftest_file" ||
+       ! grep -Eq '^Self-test status:[[:space:]]*No self-test in progress[[:space:]]*$' "$selftest_file"; then
         smart_short_test_note SKIPPED "$display" 'NVMe self-test already running or execution status cannot be established'
         return 0
     fi
-    latest_line=$(grep -m 1 -E '^[[:space:]]*0[[:space:]]+' "$history_file" || true)
+    latest_line=$(grep -m 1 -E '^[[:space:]]*0[[:space:]]+' "$selftest_file" || true)
     if [[ -n $latest_line ]]; then
         previous_note="last logged: $(sanitize_text "$latest_line")"
-        if grep -Eq '^No Self-tests Logged[[:space:]]*$' "$history_file"; then
+        if grep -Eq '^No Self-tests Logged[[:space:]]*$' "$selftest_file"; then
             smart_short_test_note SKIPPED "$display" 'NVMe self-test history is contradictory'
             return 0
         fi
@@ -1923,8 +1955,8 @@ maybe_start_nvme_short_test() {
             smart_short_test_note SKIPPED "$display" "previous NVMe self-test was not successful or is unrecognized; review drive log; $previous_note"
             return 0
         fi
-    elif grep -Eq '^No Self-tests Logged[[:space:]]*$' "$history_file" &&
-         ! grep -Eq '^[[:space:]]*[0-9]+[[:space:]]+' "$history_file"; then
+    elif grep -Eq '^No Self-tests Logged[[:space:]]*$' "$selftest_file" &&
+         ! grep -Eq '^[[:space:]]*[0-9]+[[:space:]]+' "$selftest_file"; then
         previous_note='no prior logged NVMe self-tests'
         hours_logged=''
     else
@@ -2006,12 +2038,14 @@ maybe_start_nvme_short_test() {
     run_probe "$SMART_TIMEOUT_SECONDS" smartctl -l selftest -d nvme,0xffffffff "$controller" \
         > "$history_file.recheck" 2>&1
     rc=$?
-    recheck_latest=$(grep -m 1 -E '^[[:space:]]*0[[:space:]]+' "$history_file.recheck" || true)
-    if (( rc != 0 )) ||
-       ! grep -Eq '^Self-test Log \(NVMe Log 0x06' "$history_file.recheck" ||
-       ! grep -Eq '^Self-test status:[[:space:]]*No self-test in progress[[:space:]]*$' "$history_file.recheck" ||
+    smart_nvme_selftest_section "$history_file.recheck" > "$history_file.recheck.log"
+    extract_rc=$?
+    recheck_latest=$(grep -m 1 -E '^[[:space:]]*0[[:space:]]+' "$history_file.recheck.log" || true)
+    if (( rc != 0 || extract_rc != 0 )) ||
+       ! grep -Eq '^Self-test Log \(NVMe Log 0x06' "$history_file.recheck.log" ||
+       ! grep -Eq '^Self-test status:[[:space:]]*No self-test in progress[[:space:]]*$' "$history_file.recheck.log" ||
        [[ $recheck_latest != "$latest_line" ]] ||
-       { [[ -z $latest_line ]] && ! grep -Eq '^No Self-tests Logged[[:space:]]*$' "$history_file.recheck"; }; then
+       { [[ -z $latest_line ]] && ! grep -Eq '^No Self-tests Logged[[:space:]]*$' "$history_file.recheck.log"; }; then
         smart_short_test_note SKIPPED "$display" 'NVMe controller became busy, history changed, or status became unreadable before dispatch; retry cooldown applies'
         return 0
     fi
@@ -4178,7 +4212,7 @@ if (( MEGARAID_MAX_INDEX > 255 )); then
 fi
 
 core_commands=(
-    cat date dirname flock grep head hostname logger lslocks mkdir mktemp
+    awk cat date dirname flock grep head hostname logger lslocks mkdir mktemp
     paste rm sed sleep sort uname wc timeout sha256sum mv chmod cp tail
 )
 if [[ $PACKAGE_BACKEND == rpm ]]; then

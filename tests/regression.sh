@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Non-destructive regression fixtures for system-integrity-audit 2.0.3.
+# Non-destructive regression fixtures for system-integrity-audit 2.0.4.
 # Run: bash tests/regression.sh [path/to/system-integrity-audit]
 set -euo pipefail
 SCRIPT=${1:-"$(dirname "$0")/../system-integrity-audit"}
@@ -392,6 +392,7 @@ if [[ $* == *'nvme,0xffffffff'* ]]; then
     if [[ ${1:-} == -l ]]; then
         case ${MOCK_NVME_RECHECK:-same} in
             busy) sed 's/No self-test in progress/Short self-test in progress (10% completed)/' "$MOCK_DIR/nvme-history" ;;
+            power-change) sed 's/6.00W/7.00W/g' "$MOCK_DIR/nvme-history" ;;
             changed) sed 's/Completed without error/Completed: failed segments/' "$MOCK_DIR/nvme-history" ;;
             failed) echo 'Read Self-test Log failed'; exit 4 ;;
             *) cat "$MOCK_DIR/nvme-history" ;;
@@ -618,9 +619,19 @@ pass 'SMART scheduler skips RAID and unverified NVMe starts'
             printf 'smartctl %s 2023-08-01 r5530 (fixture)\n' "$version"
             printf 'Model Number: Test NVMe\nSerial Number: NVME-SERIAL\n'
             printf 'Optional Admin Commands (0x0017): Security Format Frmw_DL Self_Test\n'
+            printf 'Supported Power States\n'
+            printf 'St Op     Max   Active     Idle   RL RT WL WT  Ent_Lat  Ex_Lat\n'
+            printf ' 0 +     6.00W  0.0000W       -    0  0  0  0        0       0\n'
+            printf ' 1 +     4.00W  0.0000W       -    1  1  1  1        0       0\n\n'
+            printf 'Supported LBA Sizes (NSID 0x1)\n'
+            printf 'Id Fmt  Data  Metadt  Rel_Perf\n 0 +     512       0         0\n\n'
             printf 'SMART overall-health self-assessment test result: PASSED\nCritical Warning: 0x00\n'
             printf 'Power On Hours: %s\n' "$hours"
-            printf 'Self-test Log (NVMe Log 0x06, NSID 0xffffffff)\n'
+            if [[ $version == 7.5 ]]; then
+                printf 'Self-test Log (NVMe Log 0x06, NSID 0xffffffff)\n'
+            else
+                printf 'Self-test Log (NVMe Log 0x06)\n'
+            fi
             printf 'Self-test status: No self-test in progress\n'
             if [[ $last == none ]]; then
                 printf 'No Self-tests Logged\n'
@@ -664,6 +675,44 @@ pass 'SMART scheduler skips RAID and unverified NVMe starts'
     grep -q 'last audit-started NVMe test within 60d' "$smart_short_test_notes_file" || fail 'NVMe persistent cooldown absent'
     assert_eq "$(wc -l < "$test_dir/nvme-starts")" 1 'second audit restarted NVMe test'
     pass 'NVMe cooldown survives audits and controller renumbering through model/serial identity'
+
+    nvme_reset
+    MOCK_NVME_RECHECK=power-change nvme_run
+    assert_eq "$smart_short_test_started_count:$smart_warning_count" '1:0' 'NVMe power/LBA rows must not contradict an empty self-test log'
+    grep -q 'no prior logged NVMe self-tests' "$smart_short_test_notes_file" || fail 'empty NVMe log misclassified'
+    pass 'NVMe power-state and LBA row zero are ignored for empty logs and pre-dispatch rechecks'
+
+    nvme_reset; write_nvme_history 7.4 6000 4000
+    printf '\nSupported Power States\nSt Op Max\n 0 + 6.00W\n' >> "$test_dir/nvme-history"
+    MOCK_NVME_RECHECK=power-change nvme_run
+    assert_eq "$smart_short_test_started_count:$smart_warning_count" '1:0' 'later non-self-test section was interpreted as history'
+    grep -q 'last logged:.*Short.*Completed without error' "$smart_short_test_notes_file" || fail 'actual NVMe self-test row lost'
+    if grep -q 'last logged:.*6.00W' "$smart_short_test_notes_file"; then fail 'power-state row used as self-test'; fi
+    pass 'NVMe log section boundary preserves real history and excludes later numbered tables'
+
+    for malformed in missing-table duplicate-log duplicate-row outside-marker; do
+        nvme_reset
+        case $malformed in
+            missing-table)
+                sed -i '/No Self-tests Logged/d' "$test_dir/nvme-history"
+                printf ' 0 + 6.00W 0.0000W - 0 0 0 0 0 0\n' >> "$test_dir/nvme-history"
+                ;;
+            duplicate-log)
+                printf '\nSelf-test Log (NVMe Log 0x06)\nSelf-test status: No self-test in progress\nNo Self-tests Logged\n' >> "$test_dir/nvme-history"
+                ;;
+            duplicate-row)
+                write_nvme_history 7.4 6000 4000
+                printf ' 0   Short  Completed: failed segments  5000  - - - - -\n' >> "$test_dir/nvme-history"
+                ;;
+            outside-marker)
+                sed -i '/No Self-tests Logged/d' "$test_dir/nvme-history"
+                printf '\nAnother log section\nNo Self-tests Logged\n' >> "$test_dir/nvme-history"
+                ;;
+        esac
+        nvme_run
+        assert_eq "$smart_short_test_started_count:$smart_warning_count" '0:0' 'malformed NVMe sections started a test or invented a drive warning'
+    done
+    pass 'NVMe malformed or duplicate log sections fail closed without inventing failed tests'
 
     nvme_reset
     smart_short_test_started_count=1
@@ -711,6 +760,7 @@ pass 'SMART scheduler skips RAID and unverified NVMe starts'
         [[ ! -s $test_dir/nvme-starts ]] || fail 'NVMe unsuccessful prior test obscured by another start'
         grep -q 'previous NVMe self-test was not successful' "$smart_short_test_notes_file" || fail 'NVMe prior-result reason absent'
         assert_eq "$smart_warning_count" 1 'failed NVMe self-test must warn despite PASSED overall health'
+        grep -q $'^WARNING\t/dev/nvme0 \[self-test\]\tTest NVMe\t' "$smart_summary_file" || fail 'failed NVMe test lost controller model'
         grep -q '^WARNING.*\[self-test\].*Previous NVMe self-test' "$smart_summary_file" || fail 'NVMe failure absent from SMART findings'
     done
     nvme_reset
@@ -1060,7 +1110,7 @@ MOCK_COVERAGE_MODE=normal
 export JOURNAL_TIMEOUT_SECONDS MOCK_COVERAGE_MODE
 pass 'coverage failures, empty history, short retention, and timeout handled safely'
 
-assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.3' 'embedded version'
+assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.4' 'embedded version'
 # Confirm both host-changing features are enabled when not set by the caller,
 # but retain explicit safe opt-outs for all integration/regression fixtures.
 defaults=$(env -u AUTO_INSTALL_REQUIREMENTS -u AUTO_ENABLE_PERSISTENT_JOURNAL \
@@ -1156,7 +1206,7 @@ assert_eq "$rc" 0 'full clean report exit success'
 grep -q 'Subject: .* TEST/OK - ' "$test_dir/last-email.eml" || fail 'clean status subject'
 grep -q '^From: "System Integrity Audit" <system-integrity-audit>' "$test_dir/last-email.eml" || fail 'visible From header'
 grep -q 'Audit coverage' "$test_dir/last-email.eml" || fail 'coverage section missing'
-grep -q 'Script version: *2.0.3' "$test_dir/last-email.eml" || fail 'version absent in report'
+grep -q 'Script version: *2.0.4' "$test_dir/last-email.eml" || fail 'version absent in report'
 # These labels share a fixed value column (32 characters), in both
 # email text/plain and preformatted HTML. Protect against spacing drift.
 for expected_line in \
@@ -1307,8 +1357,8 @@ pass 'placeholder disables early-failure email'
 
 # RPM distributions are no longer blocked at initialization. A separate
 # regression script validates their full package and reporting lifecycle.
-assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.3' 'v2 release version'
-pass 'RPM backend enabled in v2.0.3 release'
+assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.4' 'v2 release version'
+pass 'RPM backend enabled in v2.0.4 release'
 
 # Probe timeout must return 124, and never silently claim the check succeeded.
 run_probe 1 sleep 2 > "$test_dir/timeout-out" 2> "$test_dir/timeout-err"

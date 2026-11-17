@@ -1,4 +1,4 @@
-# Conservative automatic SMART short self-tests (v2.0.3)
+# Conservative automatic SMART short self-tests (v2.0.4)
 
 ATA support was included in v2.0.0; native NVMe support was added in v2.0.3. The feature is enabled by default with `SMART_SHORT_TEST_AUTO=1`. It may send a short self-test command to a physical disk, which changes the disk's internal test state, **not** the filesystem or package database. Review and validate on your own hardware before deploying widely.
 
@@ -22,7 +22,7 @@ The NVMe path is separate from ATA parsing:
 
 1. Map `/dev/nvmeNnM` namespaces to `/dev/nvmeN`. Deduplicate controller paths and model/serial identities. Ambiguous multipath names and non-native transports are not eligible.
 2. Query `smartctl -H -i -c -A -l selftest -d nvme,0xffffffff /dev/nvmeN`. Require smartctl **7.4+**, advertised `Self_Test` support, PASSED health with `Critical Warning: 0x00`, an explicit idle self-test status, valid power-on hours and readable history. Old tools receive a specific skip reason; the script does not replace smartmontools or install nvme-cli.
-3. Refuse failed, aborted, unknown, contradictory or missing previous results. If there is a prior successful short/extended test, require at least 1,440 additional powered-on hours by default. Grouped values such as `6,000` are accepted; backwards counters are treated as reset/ambiguous, not wrapped.
+3. Parse only the NVMe self-test log section and rows after its table header. Ignore numbered power-state and LBA-format tables, including row 0. Duplicate or malformed self-test sections fail closed. Refuse failed, aborted, unknown, contradictory or missing previous results. If there is a prior successful short/extended test, require at least 1,440 additional powered-on hours by default. Grouped values such as `6,000` are accepted; backwards counters are treated as reset/ambiguous, not wrapped.
 4. Use a model/serial-derived key in the existing state file, so controller renumbering cannot bypass the 60-calendar-day cooldown. Reject unsafe, malformed or duplicate state. Apply the same strict CPU idle/iowait gates as ATA.
 5. Persist intent, then re-read the log immediately before dispatch. Changed history, a running test or an unreadable status prevents dispatch; the cooldown remains in place. Manual tests started concurrently are also subject to smartctl's own busy check.
 6. Attempt only `smartctl -t short -d nvme,0xffffffff /dev/nvmeN`: a short test with broadcast NSID, covering all namespaces. Explicit broadcast addressing works around the namespace-scoped self-test-log issue in smartctl 7.4. No force, abort, captive or extended-test command is used.

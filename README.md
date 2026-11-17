@@ -2,7 +2,7 @@
 
 Linux package-integrity, storage-health, and filesystem auditing, with terminal and optional multipart email reporting.
 
-Version **2.0.3** provides Debian/Ubuntu (`debsums`) and Rocky Linux/RHEL (`rpm`) package-integrity backends. Live audits and automatic prerequisite reinstallation have completed on Ubuntu 24.04 and Rocky Linux 9.8. Check-only XFS scans of `/`, `/boot`, and `/home` completed successfully on the Rocky test host. The platform table below distinguishes live validation from simulated coverage and experimental platforms.
+Version **2.0.4** provides Debian/Ubuntu (`debsums`) and Rocky Linux/RHEL (`rpm`) package-integrity backends. Live audits and automatic prerequisite reinstallation have completed on Ubuntu 24.04 and Rocky Linux 9.8. Check-only XFS scans of `/`, `/boot`, and `/home` completed successfully on the Rocky test host. The platform table below distinguishes live validation from simulated coverage and experimental platforms.
 
 ## Get started
 
@@ -16,7 +16,7 @@ sudo bash tests/rpm-regression.sh
 bash tests/install-regression.sh
 ```
 
-Expected version: `system-integrity-audit 2.0.3`. Review the automatic-change defaults below before running an audit as root. For an existing checkout, switch to `main` and run `git pull --ff-only` before checking the version.
+Expected version: `system-integrity-audit 2.0.4`. Review the automatic-change defaults below before running an audit as root. For an existing checkout, switch to `main` and run `git pull --ff-only` before checking the version.
 
 ## Install and schedule weekly audits
 
@@ -96,6 +96,8 @@ The RPM scan calls `rpm -Va --noscripts --noghost` with a timeout. Verification 
 - No other test-start command has been attempted during this audit (ATA and NVMe share this limit). The script never uses captive mode or a force flag, does not wait for completion, and stores a root-only start timestamp before dispatching the command to prevent duplicate starts.
 
 SMART short-test activity appears in the terminal progress and full report, with `STARTED`, `SKIPPED`, or `DISABLED` and the reason. On color-capable terminals, `[SMART-TEST]` progress uses the same warning-yellow coloring as `[WARN]`; plain output and `NO_COLOR` remain unchanged. Logged self-test results are examined on subsequent audits. SCSI, USB bridges and RAID passthrough still receive ordinary health checks but remain excluded from automatic test initiation.
+
+Since v2.0.4, NVMe history parsing is restricted to the self-test log and its table header. Numbered rows in power-state/LBA tables are excluded, preventing false failed-test warnings or contradictory-history skips. Both the initial query and pre-dispatch recheck use the same section parser.
 
 **NVMe requirements:** smartctl **7.4 or newer**, native `/dev/nvmeN` or `/dev/nvmeNnM` paths, a controller advertising `Self_Test`, an idle self-test status, zero critical-warning bits, stable model/serial identity and a readable self-test log. The audit maps namespaces to a controller and sends `smartctl -t short -d nvme,0xffffffff /dev/nvmeN`, covering all namespaces. Explicit broadcast addressing avoids the smartctl 7.4 namespace-scoped log issue. It deduplicates controllers and device identities and uses a stable model/serial cooldown key across controller renumbering. Older tools are skipped with an upgrade reason; no replacement package or nvme-cli fallback is installed. Health checks remain available independently.
 
