@@ -2,7 +2,7 @@
 
 Linux package-integrity, storage-health, and filesystem auditing, with terminal and optional multipart email reporting.
 
-Version **2.0.4** provides Debian/Ubuntu (`debsums`) and Rocky Linux/RHEL (`rpm`) package-integrity backends. Live audits and automatic prerequisite reinstallation have completed on Ubuntu 24.04 and Rocky Linux 9.8. Check-only XFS scans of `/`, `/boot`, and `/home` completed successfully on the Rocky test host. The platform table below distinguishes live validation from simulated coverage and experimental platforms.
+Version **2.1.0** provides Debian/Ubuntu (`debsums`) and Rocky Linux/RHEL (`rpm`) package-integrity backends. Live audits and automatic prerequisite reinstallation have completed on Ubuntu 24.04 and Rocky Linux 9.8. Check-only XFS scans of `/`, `/boot`, and `/home` completed successfully on the Rocky test host. The platform table below distinguishes live validation from simulated coverage and experimental platforms.
 
 ## Get started
 
@@ -14,9 +14,13 @@ git switch main
 sudo bash tests/regression.sh
 sudo bash tests/rpm-regression.sh
 bash tests/install-regression.sh
+bash tests/notification-regression.sh
+bash tests/config-regression.sh
+bash tests/storage-regression.sh
+bash tests/safety-regression.sh
 ```
 
-Expected version: `system-integrity-audit 2.0.4`. Review the automatic-change defaults below before running an audit as root. For an existing checkout, switch to `main` and run `git pull --ff-only` before checking the version.
+Expected version: `system-integrity-audit 2.1.0`. Review the automatic-change defaults below before running an audit as root. For an existing checkout, switch to `main` and run `git pull --ff-only` before checking the version.
 
 ## Install and schedule weekly audits
 
@@ -52,6 +56,14 @@ The installer reuses its existing weekly symlink and refuses to overwrite an unr
 After the new executable and weekly symlink are installed successfully, the installer removes legacy `debsums-audit` files or symlinks from `/usr/local/bin` and `/usr/local/sbin`. It removes symlinks named `debsums-audit` in `/etc/cron.daily` and `/etc/cron.weekly`, plus other symlinks in those directories that lead to either legacy executable path. Relative, chained and dangling legacy links are included. Each removal is reported. Regular cron files and non-file legacy paths are retained with a warning for manual review; symlink targets outside the two legacy executable paths are not deleted. Failed installation or input validation leaves the old installation alone. Already-running legacy processes are not stopped.
 
 Other audit defaults remain as documented below, including automatic prerequisite installation, persistent-journal setup, and conservative SMART test initiation. XFS check-only scheduling remains opt-in; this installer prompts only for the report address.
+
+## Version 2.1.0 review fixes
+
+This release corrects all eight findings from the v2.0.4 review: ordered journald restart before flushing; checked SMART cooldown-state writes; coverage-aware finding resolution; bounded email submission; decimal numeric configuration; timestamp-only RPM configuration-file handling; current Btrfs corrected/uncorrectable summaries; and ZFS device READ/WRITE/CKSUM counters even on ONLINE pools.
+
+Unverified prior findings remain in notification state when a check fails, is disabled, or has partial/unsupported coverage. They are counted as **Prior findings unverified**, not reported as resolved. Their previous mailed timestamps are preserved. A resource absent from discovery is not assumed healthy; resolution requires positive coverage of that resource. For backend/category combinations without an explicit verification marker (including some boot-fsck, MD, Btrfs, LVM and timer findings), old findings are conservatively retained as unverified rather than automatically cleared. NVMe self-test warnings require a verified current history before they can resolve. Once coverage succeeds, normal resolution resumes.
+
+`MAIL_TIMEOUT_SECONDS=120` bounds mail submission (valid range 1–86400 seconds). Timeout/failure does not mark notifications delivered. As with other bounded probes, termination has a five-second kill grace. Accepted numeric settings are normalized to decimal before arithmetic, so `060` means 60, never octal 48. Out-of-range or overflowing values are rejected before audit work.
 
 ## Platform support
 
@@ -191,6 +203,10 @@ bash ./system-integrity-audit --version
 sudo bash tests/regression.sh
 sudo bash tests/rpm-regression.sh
 bash tests/install-regression.sh
+bash tests/safety-regression.sh
+bash tests/storage-regression.sh
+bash tests/config-regression.sh
+bash tests/notification-regression.sh
 ```
 
 The shared suite includes unattended APT command, timeout, lock-retry and pseudo-terminal job-control tests, SMART self-test scheduling, report formatting, stable-notification identity and approved-missing regression cases and also mocks Ubuntu's `dpkg-query`, so its Ubuntu scenarios run on RPM-based test hosts without requiring Debian packages. The regression suites use simulated hardware, journals, RPM results, and email. They cannot validate real device and storage behavior. Inspect the report's **Audit coverage** section and review all unexpected RPM differences on your actual machine before wider deployment.

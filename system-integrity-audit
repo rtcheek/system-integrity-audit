@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# system-integrity-audit version 2.0.4
+# system-integrity-audit version 2.1.0
 # Debian/Ubuntu and Rocky/RHEL RPM backends.
 # Audit kernel/storage health and native package-managed file integrity.
 
@@ -12,10 +12,13 @@ export PATH
 export LC_ALL=C
 
 PROGRAM_NAME='system-integrity-audit'
-PROGRAM_VERSION='2.0.4'
+PROGRAM_VERSION='2.1.0'
 readonly PROGRAM_NAME PROGRAM_VERSION
 
 # Changelog:
+#   2.1.0 (2026-11-17): Correct review findings in journal setup, SMART
+#                       state writes, bounded mail, resolution coverage,
+#                       storage parsers and decimal configuration.
 #   2.0.4 (2026-11-17): Scope NVMe history parsing to the self-test log
 #                       and its table header, excluding numbered power
 #                       states and LBA formats from result classification.
@@ -204,6 +207,7 @@ REPORT_FROM_NAME="${REPORT_FROM_NAME:-System Integrity Audit}"
 REPORT_FROM_ADDRESS="${REPORT_FROM_ADDRESS:-system-integrity-audit}"
 SUBJECT_PREFIX="${SUBJECT_PREFIX:-[system integrity audit]}"
 REPORT_COVERAGE_GAPS="${REPORT_COVERAGE_GAPS:-1}"
+MAIL_TIMEOUT_SECONDS="${MAIL_TIMEOUT_SECONDS:-120}"
 FORCE_REPORT="${FORCE_REPORT:-0}"
 TERMINAL_OUTPUT="${TERMINAL_OUTPUT:-auto}"
 PROGRESS_OUTPUT="${PROGRESS_OUTPUT:-auto}"
@@ -261,6 +265,8 @@ EXCEPTIONS_FILE="${EXCEPTIONS_FILE:-/usr/local/etc/system-integrity-audit.ignore
 MISSING_EXCEPTIONS_FILE="${MISSING_EXCEPTIONS_FILE:-/usr/local/etc/system-integrity-audit.missing.ignore}"
 declare -a exception_patterns=() missing_exception_paths=()
 declare -A smart_nvme_test_seen=()
+declare -A smart_selftest_verified=() notification_unverified_ids=()
+declare -A smart_health_verified=() filesystem_resource_verified=()
 smart_short_test_attempted=0
 exception_pattern_count=0
 missing_exception_count=0
@@ -278,6 +284,7 @@ Usage: $PROGRAM_NAME [--version|--help]
 Ubuntu compatibility targets: 20.04, 22.04, 24.04 LTS (18.04 not supported)
 
 Environment overrides:
+  MAIL_TIMEOUT_SECONDS=120         Maximum seconds for a sendmail invocation
   REPORT_TO=address                 Email recipient (default: username@email.address)
                                      Placeholder or empty value disables email
   REPORT_FROM_NAME=name             Sender display name (default: System Integrity Audit)
@@ -357,6 +364,67 @@ is_nonnegative_integer() {
 
 is_percentage_integer() {
     [[ ${1:-} =~ ^(0|[1-9][0-9]?|100)$ ]]
+}
+
+# Normalize configuration text before Bash arithmetic can interpret a leading
+# zero as octal. Compare decimal strings before evaluation so oversized input
+# cannot wrap into an otherwise valid range.
+normalize_config_integer() {
+    local config_name=$1 config_min=$2 config_max=$3 config_raw config_value
+    local LC_ALL=C
+    [[ $config_name =~ ^[A-Z][A-Z0-9_]*$ && -v $config_name ]] || return 1
+    config_raw=${!config_name}
+    [[ $config_raw =~ ^[0-9]+$ ]] || return 1
+    config_value=${config_raw#"${config_raw%%[!0]*}"}
+    config_value=${config_value:-0}
+    (( ${#config_value} >= ${#config_min} && ${#config_value} <= ${#config_max} )) || return 1
+    if [[ ${#config_value} == ${#config_min} && $config_value < $config_min ]] ||
+       [[ ${#config_value} == ${#config_max} && $config_value > $config_max ]]; then
+        return 1
+    fi
+    printf -v "$config_name" '%s' "$config_value"
+}
+
+normalize_numeric_configuration() {
+    local setting minimum maximum
+    # Unbounded integer settings must fit signed 64-bit Bash arithmetic.
+    # Notification days are multiplied by 86400; the ATA window is added to
+    # epoch timestamps, so reserve half the range for that addition.
+    while read -r setting minimum maximum; do
+        if ! normalize_config_integer "$setting" "$minimum" "$maximum"; then
+            printf '%s: %s must be a decimal integer from %s through %s.\n' \
+                "$PROGRAM_NAME" "$setting" "$minimum" "$maximum" >&2
+            return 64
+        fi
+    done <<'NUMERIC_CONFIG_RANGES'
+APT_LOCK_WAIT_SECONDS 0 9223372036854775807
+APT_LOCK_RETRY_COUNT 0 9223372036854775807
+MEGARAID_MAX_INDEX 0 255
+SCRUB_MAX_AGE_DAYS 0 9223372036854775807
+SPACE_NOTICE_PERCENT 0 100
+SPACE_WARNING_PERCENT 0 100
+SPACE_ALERT_PERCENT 0 100
+INODE_NOTICE_PERCENT 0 100
+INODE_WARNING_PERCENT 0 100
+INODE_ALERT_PERCENT 0 100
+LVM_THIN_NOTICE_PERCENT 0 100
+LVM_THIN_WARNING_PERCENT 0 100
+LVM_THIN_ALERT_PERCENT 0 100
+SMART_SHORT_TEST_AGE_DAYS 1 3650
+XFS_SCRUB_INTERVAL_DAYS 1 3650
+XFS_SCRUB_TIMEOUT_SECONDS 1 86400
+MAIL_TIMEOUT_SECONDS 1 86400
+SMART_TIMEOUT_SECONDS 1 9223372036854775807
+PROBE_TIMEOUT_SECONDS 1 9223372036854775807
+JOURNAL_TIMEOUT_SECONDS 1 9223372036854775807
+APT_COMMAND_TIMEOUT_SECONDS 1 9223372036854775807
+DEBSUMS_TIMEOUT_SECONDS 1 9223372036854775807
+RPM_VERIFY_TIMEOUT_SECONDS 1 9223372036854775807
+DNF_COMMAND_TIMEOUT_SECONDS 1 9223372036854775807
+ATA_CORRELATION_SECONDS 1 4611686018427387903
+NOTIFICATION_REPEAT_DAYS 1 106751991167300
+MEGARAID_SCAN_BUDGET_SECONDS 1 9223372036854775807
+NUMERIC_CONFIG_RANGES
 }
 
 trim_whitespace() {
@@ -1026,7 +1094,17 @@ send_report() {
     local subject=$1
     local text_body_file=$2
     local html_body_file=$3
-    local boundary from_name_header
+    local boundary from_name_header mail_timeout=${MAIL_TIMEOUT_SECONDS:-120}
+
+    # Early-failure mail may run before startup configuration normalization.
+    # Never let an invalid zero disable GNU timeout in that error path.
+    if [[ $mail_timeout =~ ^[0-9]+$ ]]; then
+        mail_timeout=${mail_timeout#"${mail_timeout%%[!0]*}"}
+        mail_timeout=${mail_timeout:-0}
+    fi
+    if [[ ! $mail_timeout =~ ^[1-9][0-9]{0,4}$ ]] || (( mail_timeout > 86400 )); then
+        mail_timeout=120
+    fi
 
     case "$REPORT_TO$REPORT_FROM_NAME$REPORT_FROM_ADDRESS$subject" in
         *$'\r'*|*$'\n'*)
@@ -1063,7 +1141,7 @@ send_report() {
         printf '\n\n'
 
         printf -- '--%s--\n' "$boundary"
-    } | sendmail -f "$REPORT_FROM_ADDRESS" -t -oi
+    } | run_probe "$mail_timeout" sendmail -f "$REPORT_FROM_ADDRESS" -t -oi
 }
 
 lookup_package_owners() {
@@ -1264,11 +1342,12 @@ ensure_persistent_journal_storage() {
         return 1
     fi
 
-    if ! run_probe "$PROBE_TIMEOUT_SECONDS" systemctl kill --kill-who=main --signal=HUP \
-            systemd-journald.service; then
-        printf '%s: unable to reload systemd-journald configuration.\n' \
+    # SIGHUP reload is supported only by systemd 258+. Use an ordered,
+    # supported restart on every supported Ubuntu/Rocky system, then flush.
+    if ! run_probe "$PROBE_TIMEOUT_SECONDS" systemctl restart systemd-journald.service; then
+        printf '%s: unable to restart systemd-journald with its new configuration.\n' \
             "$PROGRAM_NAME" >&2
-        kernel_persistence_summary='ERROR (journald reload failed)'
+        kernel_persistence_summary='ERROR (journald restart failed)'
         kernel_persistence_error=1
         return 1
     fi
@@ -1792,11 +1871,17 @@ smart_short_test_record_start() {
         while IFS=$'\t' read -r key when extra; do
             [[ $key == "$device_key" ]] && continue
             if [[ $key =~ ^[0-9a-f]{64}$ && $when =~ ^[0-9]+$ ]]; then
-                printf '%s\t%s\n' "$key" "$when" >> "$temp"
+                printf '%s\t%s\n' "$key" "$when" >> "$temp" || {
+                    rm -f -- "$temp"
+                    return 1
+                }
             fi
         done < "$SMART_SHORT_TEST_STATE_FILE" || { rm -f -- "$temp"; return 1; }
     fi
-    printf '%s\t%s\n' "$device_key" "$epoch" >> "$temp"
+    printf '%s\t%s\n' "$device_key" "$epoch" >> "$temp" || {
+        rm -f -- "$temp"
+        return 1
+    }
     if ! mv -f -- "$temp" "$SMART_SHORT_TEST_STATE_FILE"; then
         rm -f -- "$temp"
         return 1
@@ -1963,6 +2048,7 @@ maybe_start_nvme_short_test() {
         smart_short_test_note SKIPPED "$display" 'NVMe self-test history missing/ambiguous'
         return 0
     fi
+    smart_selftest_verified["$controller [self-test]"]=1
     hours_raw=$(sed -nE '/^Power On Hours:/{s/^[^:]+:[[:space:]]*//;s/[[:space:]]*$//;p;q;}' "$history_file")
     if [[ ! $hours_raw =~ ^([0-9]+|[0-9]{1,3}(,[0-9]{3})+)$ ]]; then
         smart_short_test_note SKIPPED "$display" "NVMe power-on hours unavailable; $previous_note"
@@ -2271,6 +2357,10 @@ run_smart_target() {
         fi
     fi
 
+    if [[ $status == OK || $status == WARNING || $status == FAIL ]] &&
+       (( rc != 124 && rc != 137 && (rc & 7) == 0 )); then
+        smart_health_verified["$(sanitize_text "$display_device")"]=1
+    fi
     model=$(sed -nE '/^(Device Model|Model Number|Product):/{s/^[^:]+:[[:space:]]*//;p;q;}' "$output_file")
     health=$(sed -nE '/^(SMART overall-health self-assessment test result|SMART Health Status):/{s/^[^:]+:[[:space:]]*//;p;q;}' "$output_file")
     [[ -n $model ]] || model='Unknown model'
@@ -2304,6 +2394,8 @@ run_smart_target() {
 }
 
 run_smart_checks() {
+    smart_health_verified=()
+    smart_selftest_verified=()
     smart_nvme_test_seen=()
     smart_short_test_attempted=0
     local device probe_file target_device target_type target_identity target_key
@@ -2430,6 +2522,12 @@ filesystem_is_local_persistent() {
     esac
 
     [[ $source == /dev/* ]]
+}
+
+mark_filesystem_resource_verified() {
+    local key
+    key="$(sanitize_text "$1")"$'\t'"$(sanitize_text "$2")"
+    filesystem_resource_verified[$key]=1
 }
 
 add_filesystem_finding() {
@@ -2833,7 +2931,7 @@ extract_scrub_age_days() {
 
 check_btrfs_status() {
     local source target fstype options key stats_file scrub_file line value
-    local error_count=0 corrected_count=0 uncorrectable_count=0
+    local error_count=0 corrected_count=0 uncorrectable_count=0 unverified_count=0 correction_counts_complete=0
     local scrub_date scrub_age before_findings
     local -A checked=()
 
@@ -2873,14 +2971,30 @@ check_btrfs_status() {
         fi
 
         if run_probe "$PROBE_TIMEOUT_SECONDS" btrfs scrub status "$target" > "$scrub_file" 2>&1; then
-            corrected_count=$(sed -nE 's/.*corrected[_ ]errors:[[:space:]]*([0-9]+).*/\1/Ip' "$scrub_file" | head -n 1)
-            uncorrectable_count=$(sed -nE 's/.*uncorrectable[_ ]errors:[[:space:]]*([0-9]+).*/\1/Ip' "$scrub_file" | head -n 1)
+            # Default output uses Corrected:/Uncorrectable:, while raw and
+            # older output uses corrected_errors:/uncorrectable_errors:.
+            # Anchor the label so one counter cannot match another's name.
+            corrected_count=$(sed -nE 's/^[[:space:]]*corrected([_ ]errors)?:[[:space:]]*([0-9]+)[[:space:]]*$/\2/Ip' "$scrub_file" | head -n 1)
+            uncorrectable_count=$(sed -nE 's/^[[:space:]]*uncorrectable([_ ]errors)?:[[:space:]]*([0-9]+)[[:space:]]*$/\2/Ip' "$scrub_file" | head -n 1)
+            unverified_count=$(sed -nE 's/^[[:space:]]*unverified([_ ]errors)?:[[:space:]]*([0-9]+)[[:space:]]*$/\2/Ip' "$scrub_file" | head -n 1)
+            correction_counts_complete=0
+            [[ -z $uncorrectable_count || -z $unverified_count ]] || correction_counts_complete=1
             corrected_count=${corrected_count:-0}
             uncorrectable_count=${uncorrectable_count:-0}
+            unverified_count=${unverified_count:-0}
 
             if is_nonnegative_integer "$uncorrectable_count" && (( uncorrectable_count > 0 )); then
                 add_filesystem_finding ALERT 'BTRFS-SCRUB' "$target" \
                     "The last scrub reported $uncorrectable_count uncorrectable error(s)."
+            elif is_nonnegative_integer "$unverified_count" && (( unverified_count > 0 )); then
+                add_filesystem_finding ALERT 'BTRFS-SCRUB' "$target" \
+                    "The last scrub reported $unverified_count unverified error(s); review the scrub details."
+            elif (( correction_counts_complete )) && is_nonnegative_integer "$corrected_count" && (( corrected_count > 0 )); then
+                # The summary also lists errors that redundancy repaired.
+                # Do not turn a corrected-only result into an ALERT merely
+                # because its Error summary is nonempty.
+                add_filesystem_finding WARNING 'BTRFS-SCRUB' "$target" \
+                    "The last scrub corrected $corrected_count error(s)."
             elif grep -Eqi 'with[[:space:]]+[1-9][0-9]*[[:space:]]+errors?' "$scrub_file"; then
                 add_filesystem_finding ALERT 'BTRFS-SCRUB' "$target" \
                     'The last scrub reported filesystem errors; review the scrub details.'
@@ -2890,8 +3004,9 @@ check_btrfs_status() {
                 add_filesystem_finding ALERT 'BTRFS-SCRUB' "$target" \
                     'The last scrub reported filesystem errors; review the scrub details.'
             elif is_nonnegative_integer "$corrected_count" && (( corrected_count > 0 )); then
+                filesystem_check_error_count=$((filesystem_check_error_count + 1))
                 add_filesystem_finding WARNING 'BTRFS-SCRUB' "$target" \
-                    "The last scrub corrected $corrected_count error(s)."
+                    "The last scrub corrected $corrected_count error(s), but remaining error counters are unavailable; coverage is incomplete."
             fi
 
             if grep -Eqi 'status:[[:space:]]*(running|in progress)|scrub.*running' "$scrub_file"; then
@@ -2936,6 +3051,7 @@ check_btrfs_status() {
 check_zfs_status() {
     local pool pools_file status_file state errors_line scan_line scrub_date scrub_age
     local before_findings zfs_mount_count=0 source target fstype options
+    local counters_file counters_status vdev vdev_state read_errors write_errors checksum_errors status_ok
 
     while IFS=$'\t' read -r source target fstype options; do
         [[ $fstype == zfs ]] && zfs_mount_count=$((zfs_mount_count + 1))
@@ -2958,6 +3074,8 @@ check_zfs_status() {
         fi
         return 0
     fi
+    mark_filesystem_resource_verified ZFS-CHECK 'all pools'
+    mark_filesystem_resource_verified ZFS-CHECK zpool
 
     while IFS= read -r pool || [[ -n $pool ]]; do
         [[ -n $pool ]] || continue
@@ -2965,7 +3083,10 @@ check_zfs_status() {
         before_findings=$((filesystem_alert_count + filesystem_warning_count + filesystem_notice_count))
         status_file="$work_dir/zpool-$(printf '%s' "$pool" | sed 's#[^A-Za-z0-9_.-]#_#g').txt"
 
-        if ! run_probe "$PROBE_TIMEOUT_SECONDS" zpool status -v "$pool" > "$status_file" 2>&1; then
+        # -p keeps error counters as exact integers rather than scaled values.
+        status_ok=1
+        if ! run_probe "$PROBE_TIMEOUT_SECONDS" zpool status -p -v "$pool" > "$status_file" 2>&1; then
+            status_ok=0
             filesystem_check_error_count=$((filesystem_check_error_count + 1))
             add_filesystem_finding WARNING 'ZFS-CHECK' "$pool" \
                 'zpool status returned an error; pool health could not be fully evaluated.'
@@ -2981,6 +3102,63 @@ check_zfs_status() {
         fi
         if [[ -n $errors_line && $errors_line != 'No known data errors' ]]; then
             add_filesystem_finding ALERT 'ZFS-DATA' "$pool" "$errors_line"
+        fi
+
+        # A pool may remain ONLINE with no permanent data errors while a
+        # redundant vdev has read/write/checksum errors. Parse its config
+        # table independently of the overall pool state. Use the header's
+        # column position so device paths containing spaces remain intact.
+        counters_file="$status_file.counters"
+        counters_status=0
+        awk '
+            /^[[:space:]]*config:[[:space:]]*$/ { config=1; next }
+            config && /^[[:space:]]*NAME[[:space:]]+STATE[[:space:]]+READ[[:space:]]+WRITE[[:space:]]+CKSUM/ {
+                match($0, /STATE[[:space:]]+READ[[:space:]]+WRITE[[:space:]]+CKSUM/)
+                statecol=RSTART; table=1; next
+            }
+            table && /^[[:space:]]*errors:/ { table=0; next }
+            table {
+                name=substr($0, 1, statecol-1)
+                sub(/^[[:space:]]+/, "", name); sub(/[[:space:]]+$/, "", name)
+                tail=substr($0, statecol); sub(/^[[:space:]]+/, "", tail)
+                n=split(tail, values, /[[:space:]]+/)
+                if (values[1] !~ /^(ONLINE|DEGRADED|FAULTED|OFFLINE|UNAVAIL|REMOVED|AVAIL|INUSE)$/)
+                    next
+                # Spare-only rows omit counters and can instead contain
+                # text such as "INUSE currently in use".
+                if (values[1] ~ /^(AVAIL|INUSE)$/) next
+                if (name == "" || values[2] !~ /^[0-9]+$/ || values[3] !~ /^[0-9]+$/ || values[4] !~ /^[0-9]+$/) {
+                    malformed=1; next
+                }
+                print name "\t" values[1] "\t" values[2] "\t" values[3] "\t" values[4]
+            }
+            END { if (!statecol || malformed) exit 1 }
+        ' "$status_file" > "$counters_file" || counters_status=$?
+        while IFS=$'\t' read -r vdev vdev_state read_errors write_errors checksum_errors; do
+            [[ -n $vdev ]] || continue
+            if (( status_ok && counters_status == 0 )); then
+                mark_filesystem_resource_verified ZFS-DEVICE "$pool [$vdev]"
+            fi
+            if [[ $read_errors$write_errors$checksum_errors == *[1-9]* ]]; then
+                add_filesystem_finding WARNING 'ZFS-DEVICE' "$pool [$vdev]" \
+                    "ZFS vdev reports READ=$read_errors WRITE=$write_errors CKSUM=$checksum_errors (state $vdev_state)."
+            fi
+        done < "$counters_file"
+        if (( counters_status != 0 )); then
+            filesystem_check_error_count=$((filesystem_check_error_count + 1))
+            add_filesystem_finding WARNING 'ZFS-CHECK' "$pool" \
+                'Unable to fully parse ZFS vdev error counters; coverage is incomplete.'
+        fi
+        if (( status_ok && counters_status == 0 )) && [[ -n $state && -n $errors_line ]]; then
+            mark_filesystem_resource_verified ZFS-CHECK "$pool"
+            mark_filesystem_resource_verified ZFS-POOL "$pool"
+            if [[ $errors_line == 'No known data errors' ]]; then
+                mark_filesystem_resource_verified ZFS-DATA "$pool"
+            fi
+            case "$scan_line" in
+                scrub*) mark_filesystem_resource_verified ZFS-SCRUB "$pool" ;;
+                resilver*) mark_filesystem_resource_verified ZFS-RESILVER "$pool" ;;
+            esac
         fi
 
         if [[ $scan_line =~ with[[:space:]]+([1-9][0-9]*)[[:space:]]+errors? ]]; then
@@ -3209,10 +3387,12 @@ report_xfs_scrub_result() {
     stamp=$(date -d "@$epoch" --iso-8601=seconds 2>/dev/null) || stamp=$epoch
     case "$result" in
         0)
+            mark_filesystem_resource_verified XFS-SCRUB "$target"
             add_filesystem_finding NOTICE 'XFS-SCRUB' "$target" \
                 "Last check-only scrub: $stamp, exit 0 (no errors reported); interval ${XFS_SCRUB_INTERVAL_DAYS}d."
             ;;
         2)
+            mark_filesystem_resource_verified XFS-SCRUB "$target"
             add_filesystem_finding NOTICE 'XFS-SCRUB' "$target" \
                 "Last check-only scrub: $stamp, exit 2 (optimizations possible; none requested)."
             ;;
@@ -3390,6 +3570,8 @@ check_deep_scrub_scheduling() {
 }
 
 run_filesystem_checks() {
+    local source target fstype options category
+    filesystem_resource_verified=()
     : > "$filesystem_findings_file"
     : > "$filesystem_details_file"
     : > "$local_filesystems_file"
@@ -3405,6 +3587,23 @@ run_filesystem_checks() {
     check_zfs_status
     check_lvm_status
     check_deep_scrub_scheduling
+
+    # A successful scan of the mounts that exist now says nothing about a
+    # previously failing mount/pool/array that has disappeared. Grant only
+    # the resource coverage actually obtained; unknown types stay unverified.
+    if (( filesystem_check_error_count == 0 )); then
+        mark_filesystem_resource_verified MOUNT-CHECK 'mount table'
+        while IFS=$'\t' read -r source target fstype options; do
+            [[ -n $target ]] || continue
+            mark_filesystem_resource_verified READ-ONLY "$target"
+            mark_filesystem_resource_verified READ-ONLY "$source"
+            mount_option_present "$options" bind && continue
+            for category in SPACE SPACE-CHECK INODES INODE-CHECK; do
+                mark_filesystem_resource_verified "$category" "$target"
+                mark_filesystem_resource_verified "$category" "$source"
+            done
+        done < "$local_filesystems_file"
+    fi
 
     sort -u "$filesystem_findings_file" -o "$filesystem_findings_file"
 }
@@ -3537,10 +3736,6 @@ build_rpm_findings() {
             elif [[ $flags == '.........' ]]; then
                 rpm_recognized_count=$((rpm_recognized_count + 1))
                 continue
-            elif [[ $marker == c ]]; then
-                status=CONFIG
-            elif [[ $flags == *[S5L]* ]]; then
-                status=CHANGED
             elif [[ $flags == '.......T.' ]]; then
                 # File mtimes are routinely changed by legitimate operations.
                 if is_enabled "$RPM_REPORT_TIMESTAMP_ONLY"; then
@@ -3550,6 +3745,10 @@ build_rpm_findings() {
                     rpm_recognized_count=$((rpm_recognized_count + 1))
                     continue
                 fi
+            elif [[ $marker == c ]]; then
+                status=CONFIG
+            elif [[ $flags == *[S5L]* ]]; then
+                status=CHANGED
             else
                 status=METADATA
             fi
@@ -3766,6 +3965,43 @@ finding_id() {
 # States are stored as id, severity, category, resource, last mailed time.
 # Only NOTICES and WARNINGS are coalesced. ALERT and ERROR always send.
 # RESOLVED entries force a notice email even with no remaining findings.
+# Absence is evidence of resolution only after the relevant check completed.
+# Retain prior state when coverage is disabled, failed, partial or unsupported.
+finding_resolution_verified() {
+    local category=$1 resource=$2 coverage_key
+    (( ${execution_error:-0} + ${kernel_scan_error:-0} + ${kernel_persistence_error:-0} +
+       ${filesystem_check_error_count:-0} + ${smart_error_count:-0} == 0 )) || return 1
+    case "$category" in
+        PACKAGE|PACKAGE-COVERAGE)
+            (( ${package_run_status:-0} == 0 && ${coverage_status:-0} == 0 && ${coverage_count:-0} == 0 )) || return 1
+            [[ $category != PACKAGE-COVERAGE ]] || is_enabled "$REPORT_COVERAGE_GAPS"
+            ;;
+        KERNEL|JOURNAL-*)
+            is_enabled "$KERNEL_LOG_CHECK_ENABLED" &&
+                (( ${kernel_coverage_gap:-0} + ${kernel_coverage_unknown:-0} == 0 )) ;;
+        SMART)
+            is_enabled "$SMART_CHECK_ENABLED" && (( ${smart_unsupported_count:-0} == 0 )) || return 1
+            if [[ $resource == *' [self-test]' ]]; then
+                [[ -n ${smart_selftest_verified[$resource]+x} ]]
+            else
+                [[ -n ${smart_health_verified[$resource]+x} ]]
+            fi
+            ;;
+        XFS-SCRUB)
+            coverage_key="$category"$'\t'"$resource"
+            is_enabled "$FILESYSTEM_CHECKS_ENABLED" && is_enabled "$XFS_SCRUB_AUTO" &&
+                [[ -n ${filesystem_resource_verified[$coverage_key]+x} ]] ;;
+        EXECUTION)
+            is_enabled "$KERNEL_LOG_CHECK_ENABLED" && is_enabled "$FILESYSTEM_CHECKS_ENABLED" &&
+                is_enabled "$SMART_CHECK_ENABLED" ;;
+        STATE|AUTOMATIC-CHANGE) return 0 ;;
+        *)
+            coverage_key="$category"$'\t'"$resource"
+            is_enabled "$FILESYSTEM_CHECKS_ENABLED" &&
+                [[ -n ${filesystem_resource_verified[$coverage_key]+x} ]] ;;
+    esac
+}
+
 prepare_notifications() {
     local id severity category resource detail previous last_sent now
     local previous_file="$work_dir/previous-findings.tsv" prev_id prev_sev prev_cat prev_res
@@ -3778,6 +4014,8 @@ prepare_notifications() {
     notification_new_count=0
     notification_ongoing_count=0
     notification_resolved_count=0
+    notification_unverified_count=0
+    notification_unverified_ids=()
     notification_due=0
     event_alert_count=0
     event_error_count=0
@@ -3844,6 +4082,13 @@ prepare_notifications() {
     if is_enabled "$STATEFUL_NOTIFICATIONS"; then
         for id in "${!previous_labels[@]}"; do
             if [[ -z ${current_ids[$id]+x} ]]; then
+                IFS=$'\t' read -r prev_sev prev_cat prev_res <<< "${previous_labels[$id]}"
+                if ! finding_resolution_verified "$prev_cat" "$prev_res"; then
+                    printf '%s\t%s\t%s\n' "$id" "${previous_labels[$id]}" "${previous_dates[$id]}" >> "$notification_next_state_file"
+                    notification_unverified_ids[$id]=1
+                    notification_unverified_count=$((notification_unverified_count + 1))
+                    continue
+                fi
                 notification_resolved_count=$((notification_resolved_count + 1))
                 printf '%s\n' "${previous_labels[$id]}" >> "$resolved_findings_file"
                 notification_due=1
@@ -3870,11 +4115,14 @@ save_notification_state() {
     if (( emailed )); then
         while IFS=$'\t' read -r id severity category resource last_sent; do
             [[ -n $id ]] || continue
+            if [[ -z ${notification_unverified_ids[$id]+x} ]]; then
+                last_sent=$state_now
+            fi
             printf '%s\t%s\t%s\t%s\t%s\n' \
-                "$id" "$severity" "$category" "$resource" "$state_now"
-        done < "$notification_next_state_file" > "$tmp"
+                "$id" "$severity" "$category" "$resource" "$last_sent" || { rm -f -- "$tmp"; return 1; }
+        done < "$notification_next_state_file" > "$tmp" || { rm -f -- "$tmp"; return 1; }
     else
-        cat "$notification_next_state_file" > "$tmp"
+        cat "$notification_next_state_file" > "$tmp" || { rm -f -- "$tmp"; return 1; }
     fi
     chmod 0600 -- "$tmp" || { rm -f -- "$tmp"; return 1; }
     if ! mv -f -- "$tmp" "$NOTIFICATION_STATE_FILE"; then
@@ -4146,6 +4394,8 @@ case "${ID:-}" in
 esac
 readonly PACKAGE_BACKEND PACKAGE_VERIFY_TOOL
 
+normalize_numeric_configuration || exit $?
+
 if ! is_nonnegative_integer "$APT_LOCK_WAIT_SECONDS" || \
    ! is_nonnegative_integer "$APT_LOCK_RETRY_COUNT" || \
    ! is_nonnegative_integer "$MEGARAID_MAX_INDEX" || \
@@ -4191,6 +4441,12 @@ fi
 if ! [[ $XFS_SCRUB_TIMEOUT_SECONDS =~ ^[1-9][0-9]{0,5}$ ]] ||
    (( XFS_SCRUB_TIMEOUT_SECONDS > 86400 )); then
     printf '%s: XFS_SCRUB_TIMEOUT_SECONDS must be an integer from 1 to 86400.\n' "$PROGRAM_NAME" >&2
+    exit 64
+fi
+
+if ! [[ $MAIL_TIMEOUT_SECONDS =~ ^[1-9][0-9]{0,4}$ ]] ||
+   (( MAIL_TIMEOUT_SECONDS > 86400 )); then
+    printf '%s: MAIL_TIMEOUT_SECONDS must be an integer from 1 to 86400.\n' "$PROGRAM_NAME" >&2
     exit 64
 fi
 
@@ -4628,7 +4884,7 @@ if (( event_alert_count > 0 )); then
     subject_state='ALERT'
 elif (( event_error_count > 0 )); then
     subject_state='ERROR'
-elif (( event_warning_count > 0 )); then
+elif (( event_warning_count > 0 || notification_unverified_count > 0 )); then
     subject_state='WARNING'
 elif (( event_notice_count > 0 || notification_resolved_count > 0 )); then
     subject_state='NOTICE'
@@ -4751,6 +5007,7 @@ change_message=''
     printf 'Notification findings new:      %s\n' "$notification_new_count"
     printf 'Notification findings ongoing:  %s\n' "$notification_ongoing_count"
     printf 'Notification findings resolved: %s\n' "$notification_resolved_count"
+    printf 'Prior findings unverified:      %s (retained; not resolved)\n' "$notification_unverified_count"
     printf '\n'
 
     if (( kernel_finding_count > 0 )); then

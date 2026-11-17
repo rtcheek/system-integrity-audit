@@ -1,4 +1,4 @@
-# Rocky Linux / RHEL RPM backend (v2.0.0)
+# Rocky Linux / RHEL RPM backend (v2.1.0)
 
 Version `2.0.0` on `main` recognizes `ID=rocky`, `ID=rhel`, `ID=almalinux`, and `ID=centos` from `/etc/os-release`. Mock regression suites pass, and a Rocky Linux 9.8 host has completed live audits, automatic `smartmontools` reinstallation through DNF, and check-only XFS scans. RHEL is covered by simulated fixtures; AlmaLinux/CentOS and additional releases still require representative live testing.
 
@@ -75,3 +75,5 @@ Review the terminal report's coverage summary, RPM classifications, and the kern
 - RHEL/Rocky versions may differ in packaged scrub timers, service units, and default journald policies; these shared checks require real-host verification.
 - The dedicated DNF installation path successfully reinstalled `smartmontools` on a Rocky Linux 9.8 test host. It remains enabled by default when prerequisites are missing; review host-change permissions for each deployment.
 - No deployment or signing key should be inferred from the repository. Review scripts before running as root.
+
+Timestamp-only differences are handled before configuration-file classification: ignored by default, or NOTICE with `RPM_REPORT_TIMESTAMP_ONLY=1`, including `%config` files.

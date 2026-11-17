@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Non-destructive regression fixtures for system-integrity-audit 2.0.4.
+# Non-destructive regression fixtures for system-integrity-audit 2.1.0.
 # Run: bash tests/regression.sh [path/to/system-integrity-audit]
 set -euo pipefail
 SCRIPT=${1:-"$(dirname "$0")/../system-integrity-audit"}
@@ -982,6 +982,8 @@ save_notification_state 1
 prepare_notifications
 assert_eq "$notification_due" 0 'unchanged warning suppressed until repeat interval'
 assert_eq "$notification_ongoing_count" 1 'ongoing warning tracked'
+# A disappeared warning only resolves after this device was actually read.
+smart_health_verified[/dev/sdb]=1
 : > "$smart_summary_file"
 assemble_finding_ledger
 prepare_notifications
@@ -1110,7 +1112,7 @@ MOCK_COVERAGE_MODE=normal
 export JOURNAL_TIMEOUT_SECONDS MOCK_COVERAGE_MODE
 pass 'coverage failures, empty history, short retention, and timeout handled safely'
 
-assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.4' 'embedded version'
+assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.1.0' 'embedded version'
 # Confirm both host-changing features are enabled when not set by the caller,
 # but retain explicit safe opt-outs for all integration/regression fixtures.
 defaults=$(env -u AUTO_INSTALL_REQUIREMENTS -u AUTO_ENABLE_PERSISTENT_JOURNAL \
@@ -1206,7 +1208,7 @@ assert_eq "$rc" 0 'full clean report exit success'
 grep -q 'Subject: .* TEST/OK - ' "$test_dir/last-email.eml" || fail 'clean status subject'
 grep -q '^From: "System Integrity Audit" <system-integrity-audit>' "$test_dir/last-email.eml" || fail 'visible From header'
 grep -q 'Audit coverage' "$test_dir/last-email.eml" || fail 'coverage section missing'
-grep -q 'Script version: *2.0.4' "$test_dir/last-email.eml" || fail 'version absent in report'
+grep -q 'Script version: *2.1.0' "$test_dir/last-email.eml" || fail 'version absent in report'
 # These labels share a fixed value column (32 characters), in both
 # email text/plain and preformatted HTML. Protect against spacing drift.
 for expected_line in \
@@ -1357,8 +1359,8 @@ pass 'placeholder disables early-failure email'
 
 # RPM distributions are no longer blocked at initialization. A separate
 # regression script validates their full package and reporting lifecycle.
-assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.4' 'v2 release version'
-pass 'RPM backend enabled in v2.0.4 release'
+assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.1.0' 'v2 release version'
+pass 'RPM backend enabled in v2.1.0 release'
 
 # Probe timeout must return 124, and never silently claim the check succeeded.
 run_probe 1 sleep 2 > "$test_dir/timeout-out" 2> "$test_dir/timeout-err"
