@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Non-destructive regression fixtures for system-integrity-audit 2.0.2.
+# Non-destructive regression fixtures for system-integrity-audit 2.0.3.
 # Run: bash tests/regression.sh [path/to/system-integrity-audit]
 set -euo pipefail
 SCRIPT=${1:-"$(dirname "$0")/../system-integrity-audit"}
@@ -319,6 +319,7 @@ reset_fs() {
     fsck_finding_count=0
 }
 reset_smart() {
+    smart_short_test_attempted=0
     : > "$smart_summary_file"; : > "$smart_details_file"; : > "$smart_short_test_notes_file"
     smart_short_test_started_count=0; smart_short_test_skipped_count=0
     smart_device_count=0; smart_ok_count=0; smart_warning_count=0
@@ -376,6 +377,31 @@ EOF
 cat > "$test_dir/bin/smartctl" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$MOCK_DIR/smart-calls"
+if [[ $* == *'nvme,0xffffffff'* ]]; then
+    printf '%s\n' "$*" >> "$MOCK_DIR/nvme-calls"
+    if [[ ${1:-} == -t ]]; then
+        printf '%s\n' "$*" >> "$MOCK_DIR/nvme-starts"
+        [[ -s ${MOCK_NVME_STATE_FILE:-/nonexistent} ]] || exit 97
+        if [[ ${MOCK_NVME_START_RC:-0} == 0 && ${MOCK_NVME_ACK:-yes} == yes ]]; then
+            printf 'Self-test has begun (NSID 0xffffffff)\nUse smartctl -X to abort test\n'
+        else
+            echo 'simulated rejected or unconfirmed NVMe start'
+        fi
+        exit "${MOCK_NVME_START_RC:-0}"
+    fi
+    if [[ ${1:-} == -l ]]; then
+        case ${MOCK_NVME_RECHECK:-same} in
+            busy) sed 's/No self-test in progress/Short self-test in progress (10% completed)/' "$MOCK_DIR/nvme-history" ;;
+            changed) sed 's/Completed without error/Completed: failed segments/' "$MOCK_DIR/nvme-history" ;;
+            failed) echo 'Read Self-test Log failed'; exit 4 ;;
+            *) cat "$MOCK_DIR/nvme-history" ;;
+        esac
+        exit 0
+    fi
+    [[ ${MOCK_NVME_TIMEOUT:-no} != yes ]] || exec sleep 3
+    cat "$MOCK_DIR/nvme-history"
+    exit "${MOCK_NVME_QUERY_RC:-0}"
+fi
 if [[ ${1:-} == -c && $* == *'-l selftest'* ]]; then
     cat "$MOCK_DIR/smart-test-history.txt"
     exit "${SMART_TEST_HISTORY_RC:-0}"
@@ -581,7 +607,240 @@ write_smart_history 0 6000
 maybe_start_smart_short_test /dev/sdz 'megaraid,0' '/dev/sdz [megaraid,0]' "$health_fixture" OK
 maybe_start_smart_short_test /dev/nvme0n1 '' /dev/nvme0n1 "$health_fixture" OK
 assert_eq "$smart_short_test_started_count" 0 'RAID/NVMe auto starts not supported without device-specific proofs'
-pass 'SMART scheduler conservatively skips RAID and NVMe starts'
+pass 'SMART scheduler skips RAID and unverified NVMe starts'
+
+# Native NVMe scheduler uses real smartctl-style 7.4/7.5 text fixtures.
+# Every firmware command is mocked; no /dev nodes are accessed by this suite.
+(
+    write_nvme_history() {
+        local version=${1:-7.4} hours=${2:-6,000} last=${3:-none} result=${4:-'Completed without error'}
+        {
+            printf 'smartctl %s 2023-08-01 r5530 (fixture)\n' "$version"
+            printf 'Model Number: Test NVMe\nSerial Number: NVME-SERIAL\n'
+            printf 'Optional Admin Commands (0x0017): Security Format Frmw_DL Self_Test\n'
+            printf 'SMART overall-health self-assessment test result: PASSED\nCritical Warning: 0x00\n'
+            printf 'Power On Hours: %s\n' "$hours"
+            printf 'Self-test Log (NVMe Log 0x06, NSID 0xffffffff)\n'
+            printf 'Self-test status: No self-test in progress\n'
+            if [[ $last == none ]]; then
+                printf 'No Self-tests Logged\n'
+            else
+                printf 'Num  Test_Description  Status  Power_on_Hours  Failing_LBA NSID Seg SCT Code\n'
+                printf ' 0   Short  %s  %s  - - - - -\n' "$result" "$last"
+            fi
+        } > "$test_dir/nvme-history"
+    }
+    nvme_reset() {
+        reset_smart
+        smart_nvme_test_seen=()
+        SMART_SHORT_TEST_AUTO=1
+        SMART_TIMEOUT_SECONDS=5
+        FORCE_REPORT=0
+        SMART_SHORT_TEST_STATE_FILE="$test_dir/nvme-state/starts.tsv"
+        export MOCK_NVME_STATE_FILE=$SMART_SHORT_TEST_STATE_FILE
+        rm -f -- "$SMART_SHORT_TEST_STATE_FILE"
+        : > "$test_dir/nvme-calls"; : > "$test_dir/nvme-starts"
+        export MOCK_NVME_QUERY_RC=0 MOCK_NVME_START_RC=0 MOCK_NVME_ACK=yes
+        export MOCK_NVME_RECHECK=same MOCK_NVME_TIMEOUT=no
+        smart_cpu_quiet_enough() { smart_cpu_idle_bp=9950; smart_cpu_iowait_bp=10; return 0; }
+        write_nvme_history
+    }
+    nvme_run() { maybe_start_smart_short_test "${1:-/dev/nvme0n1}" '' "${1:-/dev/nvme0n1}" "$health_fixture" OK; }
+    nvme_reset
+    write_nvme_history 7.4 6,000 4000
+    nvme_run
+    assert_eq "$smart_short_test_started_count" 1 'eligible NVMe short test started'
+    assert_eq "$(cat "$test_dir/nvme-starts")" '-t short -d nvme,0xffffffff /dev/nvme0' 'NVMe start must use broadcast controller with short test only'
+    [[ -s $SMART_SHORT_TEST_STATE_FILE ]] || fail 'NVMe intent not recorded before dispatch'
+    grep -q 'NVMe controller /dev/nvme0 short self-test initiated' "$smart_short_test_notes_file" || fail 'NVMe start note absent'
+    nvme_run /dev/nvme0n2
+    assert_eq "$(wc -l < "$test_dir/nvme-starts")" 1 'namespace duplicated controller start'
+    assert_eq "$(grep -c '^-H ' "$test_dir/nvme-calls")" 1 'controller capability probe not deduplicated'
+    pass 'NVMe supported controller starts one broadcast short test, deduplicates namespaces and records intent'
+
+    reset_smart; smart_nvme_test_seen=()
+    nvme_run /dev/nvme9n1
+    assert_eq "$smart_short_test_started_count" 0 'renumbered NVMe controller bypassed cooldown'
+    grep -q 'last audit-started NVMe test within 60d' "$smart_short_test_notes_file" || fail 'NVMe persistent cooldown absent'
+    assert_eq "$(wc -l < "$test_dir/nvme-starts")" 1 'second audit restarted NVMe test'
+    pass 'NVMe cooldown survives audits and controller renumbering through model/serial identity'
+
+    nvme_reset
+    smart_short_test_started_count=1
+    nvme_run
+    [[ ! -s $test_dir/nvme-starts ]] || fail 'NVMe ignored shared one-start limit'
+    grep -q 'one-start limit' "$smart_short_test_notes_file" || fail 'NVMe one-start reason absent'
+    nvme_reset
+    nvme_run
+    write_smart_history 0 6000 4000
+    maybe_start_smart_short_test /dev/sdz '' /dev/sdz "$health_fixture" OK
+    assert_eq "$smart_short_test_started_count" 1 'ATA start exceeded shared NVMe limit'
+    pass 'NVMe and ATA share the one-test-per-audit limit'
+
+    for version in 7.2 7.3 unknown; do
+        nvme_reset; write_nvme_history "$version"
+        nvme_run
+        [[ ! -s $test_dir/nvme-starts ]] || fail 'old or unknown smartctl version started NVMe test'
+        grep -q '7.4 or newer' "$smart_short_test_notes_file" || fail 'NVMe minimum-version reason absent'
+    done
+    nvme_reset
+    sed -i 's/ Self_Test//' "$test_dir/nvme-history"
+    nvme_run
+    [[ ! -s $test_dir/nvme-starts ]] || fail 'NVMe unsupported capability started test'
+    grep -q 'does not advertise' "$smart_short_test_notes_file" || fail 'NVMe missing-capability reason absent'
+    nvme_reset; write_nvme_history 7.5
+    nvme_run
+    assert_eq "$smart_short_test_started_count" 1 'smartctl 7.5 NVMe fixture rejected'
+    pass 'NVMe version and capability gates explain old tools and unsupported controllers'
+
+    for status in 'Short self-test in progress (12% completed)' 'Extended self-test in progress' 'Unknown status (0x3)' missing; do
+        nvme_reset
+        if [[ $status == missing ]]; then
+            sed -i '/^Self-test status:/d' "$test_dir/nvme-history"
+        else
+            sed -i "s/No self-test in progress/$status/" "$test_dir/nvme-history"
+        fi
+        nvme_run
+        [[ ! -s $test_dir/nvme-starts ]] || fail 'NVMe active or unknown status allowed a start'
+    done
+    pass 'NVMe active, unknown and missing execution states prevent starts'
+
+    for result in 'Completed: failed segments' 'Aborted: by controller reset' 'Unknown result (0xa)'; do
+        nvme_reset; write_nvme_history 7.4 6000 4000 "$result"
+        nvme_run
+        [[ ! -s $test_dir/nvme-starts ]] || fail 'NVMe unsuccessful prior test obscured by another start'
+        grep -q 'previous NVMe self-test was not successful' "$smart_short_test_notes_file" || fail 'NVMe prior-result reason absent'
+        assert_eq "$smart_warning_count" 1 'failed NVMe self-test must warn despite PASSED overall health'
+        grep -q '^WARNING.*\[self-test\].*Previous NVMe self-test' "$smart_summary_file" || fail 'NVMe failure absent from SMART findings'
+    done
+    nvme_reset
+    sed -i '/No Self-tests Logged/d' "$test_dir/nvme-history"
+    nvme_run
+    [[ ! -s $test_dir/nvme-starts ]] || fail 'NVMe missing history allowed a start'
+    nvme_reset; write_nvme_history 7.4 6000 4000
+    echo 'No Self-tests Logged' >> "$test_dir/nvme-history"
+    nvme_run
+    [[ ! -s $test_dir/nvme-starts ]] || fail 'NVMe contradictory history allowed a start'
+    pass 'NVMe failed, aborted, missing and contradictory history prevents automatic retesting'
+
+    nvme_reset; write_nvme_history 7.4 6000 5999
+    nvme_run
+    grep -q 'within 1440 powered-on hours' "$smart_short_test_notes_file" || fail 'NVMe recent firmware history ignored'
+    [[ ! -s $test_dir/nvme-starts ]] || fail 'recent NVMe test restarted'
+    nvme_reset; write_nvme_history 7.4 1000 4000
+    nvme_run
+    grep -q 'counter reset/ambiguous' "$smart_short_test_notes_file" || fail 'NVMe counter reset treated as wrap'
+    [[ ! -s $test_dir/nvme-starts ]] || fail 'NVMe counter reset allowed a start'
+    for hours in unavailable 1,2,3 99999999999999999999; do
+        nvme_reset; write_nvme_history 7.4 "$hours" 4000
+        nvme_run
+        [[ ! -s $test_dir/nvme-starts ]] || fail 'invalid NVMe power-on hours allowed a start'
+    done
+    pass 'NVMe age gate supports grouped hours and rejects recent tests, reset counters and malformed values'
+
+    for metric in busy iowait unavailable; do
+        nvme_reset
+        case $metric in
+            busy) smart_cpu_quiet_enough() { smart_cpu_idle_bp=9800; smart_cpu_iowait_bp=10; return 1; } ;;
+            iowait) smart_cpu_quiet_enough() { smart_cpu_idle_bp=9950; smart_cpu_iowait_bp=200; return 1; } ;;
+            unavailable) smart_cpu_quiet_enough() { smart_cpu_idle_bp=-1; smart_cpu_iowait_bp=-1; return 1; } ;;
+        esac
+        nvme_run
+        [[ ! -s $test_dir/nvme-starts ]] || fail 'NVMe bypassed CPU idle/iowait gate'
+    done
+    nvme_reset
+    SMART_SHORT_TEST_AUTO=0 nvme_run
+    [[ ! -s $test_dir/nvme-calls ]] || fail 'NVMe opt-out still queried self-test capabilities'
+    maybe_start_smart_short_test /dev/nvme0n1 '' /dev/nvme0n1 "$health_fixture" FAIL
+    [[ ! -s $test_dir/nvme-calls ]] || fail 'NVMe started despite failed focused health'
+    pass 'NVMe respects global opt-out, health status and strict CPU gates'
+
+    for mode in critical query-failure no-serial; do
+        nvme_reset
+        case $mode in
+            critical) sed -i 's/Critical Warning: 0x00/Critical Warning: 0x01/' "$test_dir/nvme-history" ;;
+            query-failure) export MOCK_NVME_QUERY_RC=4 ;;
+            no-serial) sed -i '/^Serial Number:/d' "$test_dir/nvme-history" ;;
+        esac
+        nvme_run
+        [[ ! -s $test_dir/nvme-starts ]] || fail 'NVMe unsafe health, query or identity allowed a start'
+    done
+    pass 'NVMe controller critical warnings, unreadable queries and missing identity prevent starts'
+
+    nvme_reset
+    nvme_run
+    read -r state_key state_epoch < "$SMART_SHORT_TEST_STATE_FILE"
+    for mode in future malformed duplicate permissions symlink; do
+        reset_smart; smart_nvme_test_seen=()
+        rm -f "$SMART_SHORT_TEST_STATE_FILE"
+        case $mode in
+            future) printf '%s\t%s\n' "$state_key" "$(( $(date +%s) + 86400 ))" > "$SMART_SHORT_TEST_STATE_FILE" ;;
+            malformed) printf '%s\tgarbage\n' "$state_key" > "$SMART_SHORT_TEST_STATE_FILE" ;;
+            duplicate) printf '%s\t0\n%s\t%s\n' "$state_key" "$state_key" "$state_epoch" > "$SMART_SHORT_TEST_STATE_FILE" ;;
+            permissions) printf '%s\t0\n' "$state_key" > "$SMART_SHORT_TEST_STATE_FILE"; chmod 666 "$SMART_SHORT_TEST_STATE_FILE" ;;
+            symlink) ln -s "$test_dir/smart-test-state.tsv" "$SMART_SHORT_TEST_STATE_FILE" ;;
+        esac
+        nvme_run
+        assert_eq "$smart_short_test_started_count" 0 'NVMe unsafe state bypassed cooldown'
+    done
+    nvme_reset
+    chmod 755 "${SMART_SHORT_TEST_STATE_FILE%/*}"
+    nvme_run
+    [[ ! -s $test_dir/nvme-starts ]] || fail 'NVMe first start accepted a nonprivate state directory'
+    chmod 700 "${SMART_SHORT_TEST_STATE_FILE%/*}"
+    pass 'NVMe future, malformed, duplicate, nonprivate and symlinked state fails closed'
+
+    nvme_reset
+    (
+        smart_short_test_record_start() { return 1; }
+        nvme_run
+        [[ ! -s $test_dir/nvme-starts ]] || fail 'NVMe started before durable state was written'
+    ) || fail 'NVMe state-write gate fixture'
+    for mode in busy changed failed; do
+        nvme_reset; write_nvme_history 7.4 6000 4000
+        MOCK_NVME_RECHECK=$mode nvme_run
+        [[ ! -s $test_dir/nvme-starts && -s $SMART_SHORT_TEST_STATE_FILE ]] || fail 'NVMe pre-dispatch race did not fail closed with cooldown'
+    done
+    pass 'NVMe requires durable intent and rechecks status and history immediately before dispatch'
+
+    for outcome in rejected no-ack; do
+        nvme_reset
+        if [[ $outcome == rejected ]]; then export MOCK_NVME_START_RC=4; else export MOCK_NVME_ACK=no; fi
+        nvme_run
+        assert_eq "$smart_short_test_started_count" 0 'NVMe unconfirmed start reported as started'
+        grep -q '^FAILED' "$smart_short_test_notes_file" || fail 'NVMe start rejection not reported'
+        assert_eq "$smart_warning_count" 1 'unconfirmed NVMe start must generate a SMART warning'
+        [[ -s $SMART_SHORT_TEST_STATE_FILE ]] || fail 'NVMe start rejection lost cooldown'
+        reset_smart; smart_nvme_test_seen=()
+        nvme_run
+        assert_eq "$(wc -l < "$test_dir/nvme-starts")" 1 'NVMe rejected start immediately retried'
+    done
+    pass 'NVMe rejected or unacknowledged commands are not successes and retain cooldown'
+
+    nvme_reset
+    MOCK_NVME_ACK=no nvme_run
+    write_nvme_history
+    sed -i 's/NVME-SERIAL/NVME-SECOND/' "$test_dir/nvme-history"
+    nvme_run /dev/nvme1n1
+    assert_eq "$(wc -l < "$test_dir/nvme-starts")" 1 'unconfirmed NVMe dispatch allowed a second controller test'
+    maybe_start_smart_short_test /dev/sdz '' /dev/sdz "$health_fixture" OK
+    assert_eq "$smart_short_test_started_count" 0 'ATA test followed unconfirmed NVMe dispatch'
+    pass 'unconfirmed NVMe dispatch reserves the shared per-audit attempt budget'
+
+    nvme_reset
+    SMART_TIMEOUT_SECONDS=1 MOCK_NVME_TIMEOUT=yes nvme_run
+    [[ ! -s $test_dir/nvme-starts && ! -e $SMART_SHORT_TEST_STATE_FILE ]] || fail 'NVMe timed-out probe still attempted a start'
+    grep -q 'probe timed out' "$smart_short_test_notes_file" || fail 'NVMe probe timeout reason absent'
+    pass 'NVMe capability/history query is time bounded and cannot start after timeout'
+
+    nvme_reset
+    nvme_run /dev/nvme0c1n1
+    maybe_start_smart_short_test /dev/nvme0n1 sntjmicron /dev/nvme0n1 "$health_fixture" OK
+    [[ ! -s $test_dir/nvme-calls ]] || fail 'NVMe ambiguous or passthrough path queried for automatic start'
+    FORCE_REPORT=1 nvme_run
+    grep -q 'NVMe self-test capability/history for /dev/nvme0' "$smart_details_file" || fail 'NVMe diagnostic detail absent'
+    pass 'NVMe ambiguous transports stay excluded and forced reports include controller diagnostics'
+) || fail 'NVMe scheduler regression group'
 
 # Verify real CPU sampler values (based on two simulated /proc/stat reads).
 unset -f smart_cpu_quiet_enough
@@ -801,7 +1060,7 @@ MOCK_COVERAGE_MODE=normal
 export JOURNAL_TIMEOUT_SECONDS MOCK_COVERAGE_MODE
 pass 'coverage failures, empty history, short retention, and timeout handled safely'
 
-assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.2' 'embedded version'
+assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.3' 'embedded version'
 # Confirm both host-changing features are enabled when not set by the caller,
 # but retain explicit safe opt-outs for all integration/regression fixtures.
 defaults=$(env -u AUTO_INSTALL_REQUIREMENTS -u AUTO_ENABLE_PERSISTENT_JOURNAL \
@@ -897,7 +1156,7 @@ assert_eq "$rc" 0 'full clean report exit success'
 grep -q 'Subject: .* TEST/OK - ' "$test_dir/last-email.eml" || fail 'clean status subject'
 grep -q '^From: "System Integrity Audit" <system-integrity-audit>' "$test_dir/last-email.eml" || fail 'visible From header'
 grep -q 'Audit coverage' "$test_dir/last-email.eml" || fail 'coverage section missing'
-grep -q 'Script version: *2.0.2' "$test_dir/last-email.eml" || fail 'version absent in report'
+grep -q 'Script version: *2.0.3' "$test_dir/last-email.eml" || fail 'version absent in report'
 # These labels share a fixed value column (32 characters), in both
 # email text/plain and preformatted HTML. Protect against spacing drift.
 for expected_line in \
@@ -1048,8 +1307,8 @@ pass 'placeholder disables early-failure email'
 
 # RPM distributions are no longer blocked at initialization. A separate
 # regression script validates their full package and reporting lifecycle.
-assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.2' 'v2 release version'
-pass 'RPM backend enabled in v2.0.2 release'
+assert_eq "$(bash "$SCRIPT" --version)" 'system-integrity-audit 2.0.3' 'v2 release version'
+pass 'RPM backend enabled in v2.0.3 release'
 
 # Probe timeout must return 124, and never silently claim the check succeeded.
 run_probe 1 sleep 2 > "$test_dir/timeout-out" 2> "$test_dir/timeout-err"

@@ -2,7 +2,7 @@
 
 Linux package-integrity, storage-health, and filesystem auditing, with terminal and optional multipart email reporting.
 
-Version **2.0.2** provides Debian/Ubuntu (`debsums`) and Rocky Linux/RHEL (`rpm`) package-integrity backends. Live audits and automatic prerequisite reinstallation have completed on Ubuntu 24.04 and Rocky Linux 9.8. Check-only XFS scans of `/`, `/boot`, and `/home` completed successfully on the Rocky test host. The platform table below distinguishes live validation from simulated coverage and experimental platforms.
+Version **2.0.3** provides Debian/Ubuntu (`debsums`) and Rocky Linux/RHEL (`rpm`) package-integrity backends. Live audits and automatic prerequisite reinstallation have completed on Ubuntu 24.04 and Rocky Linux 9.8. Check-only XFS scans of `/`, `/boot`, and `/home` completed successfully on the Rocky test host. The platform table below distinguishes live validation from simulated coverage and experimental platforms.
 
 ## Get started
 
@@ -16,7 +16,7 @@ sudo bash tests/rpm-regression.sh
 bash tests/install-regression.sh
 ```
 
-Expected version: `system-integrity-audit 2.0.2`. Review the automatic-change defaults below before running an audit as root. For an existing checkout, switch to `main` and run `git pull --ff-only` before checking the version.
+Expected version: `system-integrity-audit 2.0.3`. Review the automatic-change defaults below before running an audit as root. For an existing checkout, switch to `main` and run `git pull --ff-only` before checking the version.
 
 ## Install and schedule weekly audits
 
@@ -87,15 +87,19 @@ The RPM scan calls `rpm -Va --noscripts --noghost` with a timeout. Verification 
 
 ## Automatic SMART short self-tests
 
-**Enabled by default** in v2.0.0: `SMART_SHORT_TEST_AUTO=1`. The audit may start a *non-captive*, background ATA SMART short self-test on a directly attached disk if **all** of these checks pass:
+**Enabled by default:** `SMART_SHORT_TEST_AUTO=1`. Since v2.0.3 the audit supports background short self-tests on both directly attached **ATA** disks and verified native **NVMe** controllers, if **all** of these checks pass:
 
-- The device's focused SMART health result is OK, ATA self-tests are supported, and self-test history is readable.
-- No self-test is already running, no previous self-test has an unreviewed failure, and no recent test is recorded. Previous script-initiated tests use a calendar timestamp; older ATA history uses elapsed **power-on hours as a conservative proxy**, not a guaranteed calendar age.
+- The device's focused SMART health result is OK, the required protocol-specific self-test capability is advertised, and execution status/history can be verified.
+- No self-test is already running, no previous self-test has an unreviewed failure, and no recent test is recorded. Previous script-initiated tests use a calendar timestamp; older ATA/NVMe history uses elapsed **power-on hours as a conservative proxy**, not a guaranteed calendar age.
 - At least 60 days have elapsed since the last audit-started test, and older completed test history is at least 1,440 powered-on hours old. If history is ambiguous, the test is skipped.
 - A one-second aggregate `/proc/stat` CPU sample measures **idle strictly above 98%** and **I/O wait strictly below 2%**. If metrics are unavailable or thresholds fail, the test is skipped.
-- No other test has been started during this audit. The script never uses captive mode or a force flag, does not wait for completion, and stores a root-only start timestamp before dispatching the command to prevent duplicate starts.
+- No other test-start command has been attempted during this audit (ATA and NVMe share this limit). The script never uses captive mode or a force flag, does not wait for completion, and stores a root-only start timestamp before dispatching the command to prevent duplicate starts.
 
-SMART short-test activity appears in the terminal progress and full report, with `STARTED`, `SKIPPED`, or `DISABLED` and the reason. On color-capable terminals, `[SMART-TEST]` progress uses the same warning-yellow coloring as `[WARN]`; plain output and `NO_COLOR` remain unchanged. Logged self-test results are examined on subsequent audits. Other health checks still run on NVMe, SCSI, and RAID devices, but **automatic test initiation skips them** until their semantics are separately validated.
+SMART short-test activity appears in the terminal progress and full report, with `STARTED`, `SKIPPED`, or `DISABLED` and the reason. On color-capable terminals, `[SMART-TEST]` progress uses the same warning-yellow coloring as `[WARN]`; plain output and `NO_COLOR` remain unchanged. Logged self-test results are examined on subsequent audits. SCSI, USB bridges and RAID passthrough still receive ordinary health checks but remain excluded from automatic test initiation.
+
+**NVMe requirements:** smartctl **7.4 or newer**, native `/dev/nvmeN` or `/dev/nvmeNnM` paths, a controller advertising `Self_Test`, an idle self-test status, zero critical-warning bits, stable model/serial identity and a readable self-test log. The audit maps namespaces to a controller and sends `smartctl -t short -d nvme,0xffffffff /dev/nvmeN`, covering all namespaces. Explicit broadcast addressing avoids the smartctl 7.4 namespace-scoped log issue. It deduplicates controllers and device identities and uses a stable model/serial cooldown key across controller renumbering. Older tools are skipped with an upgrade reason; no replacement package or nvme-cli fallback is installed. Health checks remain available independently.
+
+For NVMe, power-on-hour counters that run backwards are treated as ambiguous, not wrapped. The log is rechecked immediately before dispatch; changed, busy or unreadable state prevents a start. The command must return success **and** acknowledge that the self-test began before the report says `STARTED`. Failed/unconfirmed dispatches still reserve the per-audit attempt budget and retain the 60-day retry cooldown. A start acknowledgement does not mean the test has completed or passed. An unsuccessful or unrecognized latest test result, or a failed/unacknowledged dispatch, creates a normal SMART warning even if overall health says PASSED; existing notification rules apply. Native NVMe automatic initiation has mock coverage; live hardware validation remains pending. `FORCE_REPORT=1` includes the controller capability/history query for troubleshooting.
 
 To opt out for a single run:
 

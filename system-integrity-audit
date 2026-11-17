@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# system-integrity-audit version 2.0.2
+# system-integrity-audit version 2.0.3
 # Debian/Ubuntu and Rocky/RHEL RPM backends.
 # Audit kernel/storage health and native package-managed file integrity.
 
@@ -12,10 +12,13 @@ export PATH
 export LC_ALL=C
 
 PROGRAM_NAME='system-integrity-audit'
-PROGRAM_VERSION='2.0.2'
+PROGRAM_VERSION='2.0.3'
 readonly PROGRAM_NAME PROGRAM_VERSION
 
 # Changelog:
+#   2.0.3 (2026-11-16): Support native NVMe controller short self-tests
+#                       with capability/history checks, controller-level
+#                       deduplication and the existing quiet-host gates.
 #   2.0.2 (2026-11-13): Remove legacy debsums-audit executables and
 #                       daily/weekly cron symlinks after successful setup
 #                       through the companion installer.
@@ -254,6 +257,8 @@ NOTIFICATION_STATE_FILE="${NOTIFICATION_STATE_FILE:-/var/lib/system-integrity-au
 EXCEPTIONS_FILE="${EXCEPTIONS_FILE:-/usr/local/etc/system-integrity-audit.ignore}"
 MISSING_EXCEPTIONS_FILE="${MISSING_EXCEPTIONS_FILE:-/usr/local/etc/system-integrity-audit.missing.ignore}"
 declare -a exception_patterns=() missing_exception_paths=()
+declare -A smart_nvme_test_seen=()
+smart_short_test_attempted=0
 exception_pattern_count=0
 missing_exception_count=0
 OS_RELEASE_FILE="${OS_RELEASE_FILE:-/etc/os-release}"
@@ -308,7 +313,7 @@ Environment overrides:
   SMART_SHORT_TEST_AGE_DAYS=60     Minimum test age (calendar state/power-on-hour history)
   SMART_SHORT_TEST_STATE_FILE=path Root-only record of audit-initiated tests
   SMART_CPU_STAT_PATH=/proc/stat  Kernel CPU counters (override for testing)
-                                     Starts at most one non-captive ATA test per audit
+                                     Attempts at most one ATA/NVMe short test per audit
                                      only if CPU idle >98% and iowait <2%
   MEGARAID_COMPLETE_SCAN=0         Trust --scan-open; skip complementary probes
   MEGARAID_SCAN_BUDGET_SECONDS=240 Limit complementary scan duration
@@ -1812,9 +1817,222 @@ smart_short_test_previous_start() {
     printf '0\n'
 }
 
-# This first version only auto-starts directly addressable ATA disks. SCSI,
-# NVMe, USB bridges without confirmed ATA capabilities, and RAID passthrough
-# are audited normally but skipped for automated test initiation.
+# The NVMe path requires an unambiguous private state file. In particular,
+# malformed or duplicate records must not silently become a zero timestamp.
+smart_nvme_state_trusted() {
+    local key when extra dir=${SMART_SHORT_TEST_STATE_FILE%/*}
+    local -A seen=()
+    [[ $SMART_SHORT_TEST_STATE_FILE == /* && ! -L $SMART_SHORT_TEST_STATE_FILE && ! -L $dir ]] || return 1
+    command -v stat >/dev/null 2>&1 || return 1
+    if [[ -e $dir ]]; then
+        [[ -d $dir && $(stat -c '%u:%a' -- "$dir") == "$EUID:700" ]] || return 1
+    fi
+    [[ -e $SMART_SHORT_TEST_STATE_FILE ]] || return 0
+    [[ -f $SMART_SHORT_TEST_STATE_FILE && -r $SMART_SHORT_TEST_STATE_FILE &&
+       $(stat -c '%u:%a' -- "$SMART_SHORT_TEST_STATE_FILE") == "$EUID:600" &&
+       $(stat -c '%u:%a' -- "$dir") == "$EUID:700" ]] || return 1
+    while IFS=$'\t' read -r key when extra || [[ -n $key || -n $when || -n $extra ]]; do
+        [[ $key =~ ^[0-9a-f]{64}$ && $when =~ ^[0-9]{1,10}$ && -z $extra && -z ${seen[$key]+x} ]] || return 1
+        seen[$key]=1
+    done < "$SMART_SHORT_TEST_STATE_FILE"
+}
+
+# NVMe overall-health status can remain PASSED after a failed self-test.
+# Add a normal SMART warning row so the existing finding ledger, notification
+# policy and report include this condition even when FORCE_REPORT is unset.
+smart_nvme_test_warning() {
+    local controller=$1 history_file=$2 detail=$3 model
+    model=$(sed -nE '/^Model Number:/{s/^[^:]+:[[:space:]]*//;s/[[:space:]]*$//;p;q;}' "$history_file")
+    smart_warning_count=$((smart_warning_count + 1))
+    printf 'WARNING\t%s\t%s\t%s\n' "$(sanitize_text "$controller [self-test]")" \
+        "$(sanitize_text "${model:-Unknown NVMe model}")" "$(sanitize_text "$detail")" >> "$smart_summary_file"
+}
+
+# NVMe self-tests are controller-wide when addressed with broadcast NSID.
+# Do not reuse ATA status fields, 16-bit lifetime-hour wrap, or namespace keys.
+maybe_start_nvme_short_test() {
+    local device=$1 display=$2 controller history_file rc version_major version_minor
+    local serial model device_key now last_epoch latest_line previous_note
+    local hours_raw hours_current hours_logged age_hours line recheck_latest
+    if [[ $device =~ ^/dev/(nvme[0-9]+)(n[0-9]+)?$ ]]; then
+        controller="/dev/${BASH_REMATCH[1]}"
+    else
+        smart_short_test_note SKIPPED "$display" 'cannot establish a direct NVMe controller path'
+        return 0
+    fi
+    if [[ -n ${smart_nvme_test_seen[$controller]+x} ]]; then
+        smart_short_test_note SKIPPED "$display" "NVMe controller $controller already evaluated through another namespace"
+        return 0
+    fi
+    smart_nvme_test_seen[$controller]=1
+    history_file="$work_dir/smart-selftest-${controller##*/}.txt"
+    # Explicit broadcast NSID also avoids the namespace-scoped log-read issue
+    # in smartctl 7.4. Versions 7.5+ use broadcast for this log automatically.
+    run_probe "$SMART_TIMEOUT_SECONDS" smartctl -H -i -c -A -l selftest \
+        -d nvme,0xffffffff "$controller" > "$history_file" 2>&1
+    rc=$?
+    if is_enabled "$FORCE_REPORT" || (( rc != 0 )); then
+        printf 'NVMe self-test capability/history for %s (exit %s)\n' "$controller" "$rc" >> "$smart_details_file"
+        while IFS= read -r line || [[ -n $line ]]; do
+            printf '%s\n' "$(sanitize_smart_detail_line "$line")" >> "$smart_details_file"
+        done < "$history_file"
+        printf '\n' >> "$smart_details_file"
+    fi
+    if (( rc == 124 || rc == 137 )); then
+        smart_short_test_note SKIPPED "$display" "NVMe capability/history probe timed out (controller $controller)"
+        return 0
+    fi
+    line=$(head -n 1 "$history_file")
+    if [[ $line =~ ^smartctl[[:space:]]+([0-9]{1,3})\.([0-9]{1,3}) ]]; then
+        version_major=$((10#${BASH_REMATCH[1]}))
+        version_minor=$((10#${BASH_REMATCH[2]}))
+    else
+        smart_short_test_note SKIPPED "$display" 'cannot verify smartctl version; NVMe self-tests require smartctl 7.4 or newer'
+        return 0
+    fi
+    if (( version_major < 7 || (version_major == 7 && version_minor < 4) )); then
+        smart_short_test_note SKIPPED "$display" "NVMe self-tests require smartctl 7.4 or newer (found $version_major.$version_minor); health checks retained"
+        return 0
+    fi
+    if ! grep -Eq '^Optional Admin Commands.*[[:space:]]Self_Test([[:space:]]|$)' "$history_file"; then
+        smart_short_test_note SKIPPED "$display" 'NVMe controller does not advertise Device Self-test support, or capability is unreadable'
+        return 0
+    fi
+    if (( rc != 0 )) ||
+       ! grep -Eq '^SMART overall-health self-assessment test result:[[:space:]]*PASSED[[:space:]]*$' "$history_file" ||
+       ! grep -Eq '^Critical Warning:[[:space:]]*0x0+[[:space:]]*$' "$history_file"; then
+        smart_short_test_note SKIPPED "$display" "NVMe controller health or self-test history not OK/readable (exit $rc)"
+        return 0
+    fi
+    if ! grep -Eq '^Self-test Log \(NVMe Log 0x06' "$history_file" ||
+       ! grep -Eq '^Self-test status:[[:space:]]*No self-test in progress[[:space:]]*$' "$history_file"; then
+        smart_short_test_note SKIPPED "$display" 'NVMe self-test already running or execution status cannot be established'
+        return 0
+    fi
+    latest_line=$(grep -m 1 -E '^[[:space:]]*0[[:space:]]+' "$history_file" || true)
+    if [[ -n $latest_line ]]; then
+        previous_note="last logged: $(sanitize_text "$latest_line")"
+        if grep -Eq '^No Self-tests Logged[[:space:]]*$' "$history_file"; then
+            smart_short_test_note SKIPPED "$display" 'NVMe self-test history is contradictory'
+            return 0
+        fi
+        if [[ $latest_line =~ ^[[:space:]]*0[[:space:]]+(Short|Extended)[[:space:]]+Completed[[:space:]]+without[[:space:]]+error[[:space:]]+([0-9]{1,12})[[:space:]] ]]; then
+            hours_logged=$((10#${BASH_REMATCH[2]}))
+        else
+            smart_nvme_test_warning "$controller" "$history_file" "Previous NVMe self-test was not successful or is unrecognized; $previous_note"
+            smart_short_test_note SKIPPED "$display" "previous NVMe self-test was not successful or is unrecognized; review drive log; $previous_note"
+            return 0
+        fi
+    elif grep -Eq '^No Self-tests Logged[[:space:]]*$' "$history_file" &&
+         ! grep -Eq '^[[:space:]]*[0-9]+[[:space:]]+' "$history_file"; then
+        previous_note='no prior logged NVMe self-tests'
+        hours_logged=''
+    else
+        smart_short_test_note SKIPPED "$display" 'NVMe self-test history missing/ambiguous'
+        return 0
+    fi
+    hours_raw=$(sed -nE '/^Power On Hours:/{s/^[^:]+:[[:space:]]*//;s/[[:space:]]*$//;p;q;}' "$history_file")
+    if [[ ! $hours_raw =~ ^([0-9]+|[0-9]{1,3}(,[0-9]{3})+)$ ]]; then
+        smart_short_test_note SKIPPED "$display" "NVMe power-on hours unavailable; $previous_note"
+        return 0
+    fi
+    hours_raw=${hours_raw//,/}
+    if (( ${#hours_raw} > 12 )); then
+        smart_short_test_note SKIPPED "$display" 'NVMe power-on hours exceed supported range; history ambiguous'
+        return 0
+    fi
+    hours_current=$((10#$hours_raw))
+    serial=$(sed -nE '/^Serial Number:/{s/^[^:]+:[[:space:]]*//;s/[[:space:]]*$//;p;q;}' "$history_file")
+    model=$(sed -nE '/^Model Number:/{s/^[^:]+:[[:space:]]*//;s/[[:space:]]*$//;p;q;}' "$history_file")
+    if [[ -z $serial || -z $model || $serial == 0 || $serial == Unknown ]]; then
+        smart_short_test_note SKIPPED "$display" 'NVMe stable model/serial identity unavailable'
+        return 0
+    fi
+    device_key=$(printf 'nvme\n%s\n%s\n' "$model" "$serial" | sha256sum)
+    device_key=${device_key%% *}
+    if [[ -n ${smart_nvme_test_seen[$device_key]+x} ]]; then
+        smart_short_test_note SKIPPED "$display" 'NVMe device identity already evaluated through another controller path'
+        return 0
+    fi
+    smart_nvme_test_seen[$device_key]=1
+    if ! smart_nvme_state_trusted; then
+        smart_short_test_note SKIPPED "$display" 'cannot read trusted short-test state file (unsafe, malformed or duplicate records)'
+        return 0
+    fi
+    now=$(date +%s)
+    last_epoch=$(smart_short_test_previous_start "$device_key") || {
+        smart_short_test_note SKIPPED "$display" 'cannot read trusted short-test state file'
+        return 0
+    }
+    # Reject corrupt or overflowing state instead of silently restarting a
+    # controller. Device numbering is deliberately absent from this key.
+    if [[ ! $last_epoch =~ ^[0-9]{1,10}$ ]]; then
+        smart_short_test_note SKIPPED "$display" 'NVMe last-start timestamp is invalid; test not initiated'
+        return 0
+    fi
+    last_epoch=$((10#$last_epoch))
+    if (( last_epoch > 0 && (now < last_epoch || now - last_epoch < SMART_SHORT_TEST_AGE_DAYS * 86400) )); then
+        smart_short_test_note SKIPPED "$display" "last audit-started NVMe test within ${SMART_SHORT_TEST_AGE_DAYS}d; $previous_note"
+        return 0
+    fi
+    age_hours=$((SMART_SHORT_TEST_AGE_DAYS * 24))
+    if [[ -n $hours_logged ]]; then
+        if (( hours_current < hours_logged )); then
+            smart_short_test_note SKIPPED "$display" "NVMe power-on hours precede last test; counter reset/ambiguous; $previous_note"
+            return 0
+        elif (( hours_current - hours_logged < age_hours )); then
+            smart_short_test_note SKIPPED "$display" "last logged NVMe test within ${age_hours} powered-on hours; $previous_note"
+            return 0
+        fi
+    fi
+    if (( smart_short_test_started_count > 0 || smart_short_test_attempted > 0 )); then
+        smart_short_test_note SKIPPED "$display" 'another short test was started during this audit (one-start limit)'
+        return 0
+    fi
+    if ! smart_cpu_quiet_enough; then
+        if (( smart_cpu_idle_bp < 0 || smart_cpu_iowait_bp < 0 )); then
+            smart_short_test_note SKIPPED "$display" 'CPU idle/iowait measurements unavailable'
+        else
+            smart_short_test_note SKIPPED "$display" "CPU idle=$((smart_cpu_idle_bp/100)).$((smart_cpu_idle_bp%100))% (must >98%), iowait=$((smart_cpu_iowait_bp/100)).$((smart_cpu_iowait_bp%100))% (must <2%)"
+        fi
+        return 0
+    fi
+    if ! smart_short_test_record_start "$device_key" "$now"; then
+        smart_short_test_note SKIPPED "$display" 'unable to save last-start state safely; NVMe test not initiated'
+        return 0
+    fi
+    # Recheck firmware immediately before dispatch; never use a force, abort,
+    # captive, long-test or namespace-scoped command. No result is assumed.
+    run_probe "$SMART_TIMEOUT_SECONDS" smartctl -l selftest -d nvme,0xffffffff "$controller" \
+        > "$history_file.recheck" 2>&1
+    rc=$?
+    recheck_latest=$(grep -m 1 -E '^[[:space:]]*0[[:space:]]+' "$history_file.recheck" || true)
+    if (( rc != 0 )) ||
+       ! grep -Eq '^Self-test Log \(NVMe Log 0x06' "$history_file.recheck" ||
+       ! grep -Eq '^Self-test status:[[:space:]]*No self-test in progress[[:space:]]*$' "$history_file.recheck" ||
+       [[ $recheck_latest != "$latest_line" ]] ||
+       { [[ -z $latest_line ]] && ! grep -Eq '^No Self-tests Logged[[:space:]]*$' "$history_file.recheck"; }; then
+        smart_short_test_note SKIPPED "$display" 'NVMe controller became busy, history changed, or status became unreadable before dispatch; retry cooldown applies'
+        return 0
+    fi
+    smart_short_test_attempted=1
+    run_probe "$SMART_TIMEOUT_SECONDS" smartctl -t short -d nvme,0xffffffff "$controller" \
+       > "$history_file.start" 2>&1
+    rc=$?
+    if (( rc == 0 )) && grep -Eq '^Self-test has begun([[:space:](]|$)' "$history_file.start"; then
+        smart_short_test_note STARTED "$display" "NVMe controller $controller short self-test initiated (all namespaces); result checked next audit; $previous_note"
+    else
+        smart_nvme_test_warning "$controller" "$history_file" 'NVMe short-test initiation failed or was not acknowledged; retry cooldown applies.'
+        smart_short_test_note FAILED "$display" 'smartctl rejected NVMe short-test initiation; inspect device output (retry cooldown applies)'
+        printf 'NVMe self-test initiation failed for %s:\n' "$controller" >> "$smart_details_file"
+        while IFS= read -r line || [[ -n $line ]]; do
+            printf '%s\n' "$(sanitize_smart_detail_line "$line")" >> "$smart_details_file"
+        done < "$history_file.start"
+    fi
+}
+
+# Direct ATA disks and verified native NVMe controllers have separate
+# capability/history parsers. Other transports remain health-check only.
 maybe_start_smart_short_test() {
     local device=$1 device_type=$2 display=$3 health_output=$4 health_status=$5
     local history_file latest_line age_note='' now last_epoch serial device_key
@@ -1829,9 +2047,12 @@ maybe_start_smart_short_test() {
         smart_short_test_note SKIPPED "$display" 'health/SMART coverage not OK'
         return 0
     fi
-    if [[ -n $device_type || $device == /dev/nvme* ]] || \
-       ! grep -q '^ATA Version is:' "$health_output"; then
-        smart_short_test_note SKIPPED "$display" 'automatic testing limited to directly attached ATA devices'
+    if [[ -z $device_type && $device == /dev/nvme* ]]; then
+        maybe_start_nvme_short_test "$device" "$display"
+        return 0
+    fi
+    if [[ -n $device_type ]] || ! grep -q '^ATA Version is:' "$health_output"; then
+        smart_short_test_note SKIPPED "$display" 'automatic testing limited to direct ATA or verified native NVMe devices'
         return 0
     fi
 
@@ -1911,7 +2132,7 @@ maybe_start_smart_short_test() {
         fi
     fi
 
-    if (( smart_short_test_started_count > 0 )); then
+    if (( smart_short_test_started_count > 0 || smart_short_test_attempted > 0 )); then
         smart_short_test_note SKIPPED "$display" 'another short test was started during this audit (one-start limit)'
         return 0
     fi
@@ -1929,6 +2150,7 @@ maybe_start_smart_short_test() {
     fi
     # No -C (captive), no -t force, no waits for completion. smartctl itself
     # refuses to start over an already-running test unless forced.
+    smart_short_test_attempted=1
     if run_probe "$SMART_TIMEOUT_SECONDS" smartctl -t short "$device" \
        > "$history_file.start" 2>&1; then
         smart_short_test_note STARTED "$display" "non-captive short test initiated; result checked next audit; $previous_note"
@@ -2048,6 +2270,8 @@ run_smart_target() {
 }
 
 run_smart_checks() {
+    smart_nvme_test_seen=()
+    smart_short_test_attempted=0
     local device probe_file target_device target_type target_identity target_key
     local discovered_count
     local -a devices=()

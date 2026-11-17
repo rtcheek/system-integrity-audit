@@ -7,7 +7,7 @@ PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 export PATH
 export LC_ALL=C
 
-INSTALLER_VERSION='2.0.2'
+INSTALLER_VERSION='2.0.3'
 INSTALL_DIR='/usr/local/sbin'
 CRON_DIR='/etc/cron.weekly'
 LEGACY_BIN_DIR='/usr/local/bin'
